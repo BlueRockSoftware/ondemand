@@ -252,21 +252,35 @@ module BatchConnect
     # @param format [String] format used when rendering template
     # @return [Boolean] whether saved successfully
     def save(app:, context:, format: nil)
+      Rails.logger.debug("BatchConnect::Session#save - Starting save with app: #{app.inspect}, context: #{context.inspect}, format: #{format.inspect}")
       self.id         = SecureRandom.uuid
       self.token      = app.token
       self.title      = app.title
       self.created_at = Time.now.to_i
       self.cluster_id = context.try(:cluster).to_s
 
+      Rails.logger.debug("BatchConnect::Session#save - About to call submit_opts with context: #{context.inspect}")
       submit_script = app.submit_opts(context, fmt: format, staged_root: staged_root) # could raise an exception
+      Rails.logger.debug("BatchConnect::Session#save - Got submit_script: #{submit_script.inspect}")
 
       self.cluster_id = submit_script.fetch(:cluster, cluster_id).to_s
+      Rails.logger.debug("BatchConnect::Session#save - Set cluster_id to: #{cluster_id}")
       raise(ClusterNotFound, I18n.t('dashboard.batch_connect_missing_cluster')) unless cluster_id.present?
 
-      stage(app.root.join("template"), context: context) && submit(submit_script)
+      stage_result = stage(app.root.join("template"), context: context)
+      Rails.logger.debug("BatchConnect::Session#save - Stage result: #{stage_result}")
+      
+      if stage_result
+        submit_result = submit(submit_script)
+        Rails.logger.debug("BatchConnect::Session#save - Submit result: #{submit_result}")
+        submit_result
+      else
+        false
+      end
     rescue => e   # rescue from all standard exceptions (app never crashes)
+      Rails.logger.error("BatchConnect::Session#save - Error: #{e.class} - #{e.message}")
+      Rails.logger.error("BatchConnect::Session#save - Backtrace: #{e.backtrace.join("\n")}")
       errors.add(:save, e.message)
-      Rails.logger.error("ERROR: #{e.class} - #{e.message}")
       false
     end
 
@@ -275,16 +289,20 @@ module BatchConnect
     # @param context [Object] context available when rendering staged files
     # @return [Boolean] whether staged successfully
     def stage(root, context: nil)
+      Rails.logger.debug("BatchConnect::Session#stage - Starting stage with root: #{root}, context: #{context.inspect}")
       staged_root.tap { |p| FileUtils.mkdir_p(p.to_s, mode: 0o0700) unless p.exist? }
 
       # Sync the template files over
+      Rails.logger.debug("BatchConnect::Session#stage - About to rsync files from #{root} to #{staged_root}")
       oe, s = Open3.capture2e('rsync', '-rlpv', '--exclude', '.*.swp', '--exclude', '*.erb', "#{root}/", staged_root.to_s)
       raise oe unless s.success?
 
       # Output user submitted context attributes for debugging purposes
+      Rails.logger.debug("BatchConnect::Session#stage - Writing user context to #{user_defined_context_file}")
       user_defined_context_file.write(JSON.pretty_generate context.as_json)
 
       # Render all template files using ERB
+      Rails.logger.debug("BatchConnect::Session#stage - About to render template files")
       render_erb_files(
         template_files(root),
         root_dir: root,
@@ -292,8 +310,9 @@ module BatchConnect
       )
       true
     rescue => e   # rescue from all standard exceptions (app never crashes)
+      Rails.logger.error("BatchConnect::Session#stage - Error: #{e.class} - #{e.message}")
+      Rails.logger.error("BatchConnect::Session#stage - Backtrace: #{e.backtrace.join("\n")}")
       errors.add(:stage, e.message)
-      Rails.logger.error("ERROR: #{e.class} - #{e.message}")
       false
     end
 
@@ -301,23 +320,31 @@ module BatchConnect
     # @param opts [#to_h] app-specific submit hash
     # @return [Boolean] whether submitted successfully
     def submit(opts = {})
+      Rails.logger.debug("BatchConnect::Session#submit - Starting submit with opts: #{opts.inspect}")
       opts = opts.to_h.compact.deep_symbolize_keys
       content = script_content opts.fetch(:batch_connect, {})
       options = script_options opts.fetch(:script, {})
+      batch_connect_data = opts.fetch(:batch_connect, {})
+
+      Rails.logger.debug("BatchConnect::Session#submit - Generated content and options: content length: #{content.length}, options: #{options.inspect}")
+      Rails.logger.debug("BatchConnect::Session#submit - Batch connect data: #{batch_connect_data.inspect}")
 
       # Record the job script for debugging purposes
       job_script_content_file.write(content)
       job_script_options_file.write(JSON.pretty_generate(options))
 
       # Submit job script
+      Rails.logger.debug("BatchConnect::Session#submit - About to submit job with adapter: #{adapter.inspect}")
       ClimateControl.modify(sanitized_env) do
-        self.job_id = adapter.submit script(content: content, options: options)
+        self.job_id = adapter.submit script(content: content, options: options, batch_connect: batch_connect_data)
       end
+      Rails.logger.debug("BatchConnect::Session#submit - Got job_id: #{job_id}")
       db_file.write(to_json, perm: 0o0600)
       true
     rescue => e   # rescue from all standard exceptions (app never crashes)
+      Rails.logger.error("BatchConnect::Session#submit - Error: #{e.class} - #{e.message}")
+      Rails.logger.error("BatchConnect::Session#submit - Backtrace: #{e.backtrace.join("\n")}")
       errors.add(:submit, e.message)
-      Rails.logger.error("ERROR: #{e.class} - #{e.message}")
       false
     end
 
@@ -325,11 +352,19 @@ module BatchConnect
     # @param opts [#to_h] script options
     # @option opts [Hash] :content ({}) job script content
     # @option opts [Hash] :options ({}) job script options
+    # @option opts [Hash] :batch_connect ({}) batch connect data
     # @return [OodCore::Job::Script] the script object
     def script(opts = {})
       opts = opts.to_h.compact.deep_symbolize_keys
       content = opts.fetch(:content, "")
       options = opts.fetch(:options, {})
+      batch_connect_data = opts.fetch(:batch_connect, {})
+
+      # Add batch_connect data to the native hash if present
+      if batch_connect_data.any?
+        options[:native] ||= {}
+        options[:native][:batch_connect] = batch_connect_data
+      end
 
       OodCore::Job::Script.new(**options.merge(content: content))
     end
