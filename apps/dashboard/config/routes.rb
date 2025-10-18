@@ -3,6 +3,22 @@
 require 'authz/app_developer_constraint'
 
 Rails.application.routes.draw do
+  # Admin API routes - v1
+  namespace :api do
+    namespace :v1 do
+      namespace :batch_connect do
+        resources :sessions, only: [:index, :create, :show, :destroy] do
+          member do
+            get :connect
+          end
+          collection do
+            get :apps
+          end
+        end
+      end
+    end
+  end
+
   if Configuration.can_access_projects?
     resources :projects do
       root 'projects#index'
