@@ -85,7 +85,7 @@ module Api
 
           # Load the app
           app = ::BatchConnect::App.from_token(app_token)
-          unless app
+          unless app && app.valid?
             return render json: {
               status: 'error',
               message: "Batch connect app not found: #{app_token}"
@@ -244,7 +244,7 @@ module Api
           user = session_info[:user]
 
           begin
-            session.delete
+            session.destroy
             Rails.logger.info("Admin API: Deleted session #{params[:id]} for user #{user}")
 
             render json: {
