@@ -159,6 +159,17 @@ module Api
           session = session_info[:session]
           user = session_info[:user]
 
+          # Get connection URL if session is running
+          connection_url = nil
+          if session.running?
+            begin
+              connection_info = session.connect.to_h
+              connection_url = build_connection_url(connection_info)
+            rescue StandardError => e
+              Rails.logger.warn("Admin API: Could not get connection URL for session #{session.id}: #{e.message}")
+            end
+          end
+
           render json: {
             status: 'success',
             session: {
@@ -170,7 +181,8 @@ module Api
               cluster_id: session.cluster_id,
               token: session.token,
               info: session.info.to_h,
-              status: session_status(session)
+              status: session_status(session),
+              connect_url: connection_url
             }
           }
 
@@ -210,6 +222,9 @@ module Api
           # Get connection information
           connection_info = session.connect.to_h
 
+          # Build connection URL based on connection type
+          connection_url = build_connection_url(connection_info)
+
           Rails.logger.info("Admin API: Retrieved connection info for session #{session.id} (user: #{user})")
 
           render json: {
@@ -217,7 +232,7 @@ module Api
             user: user,
             session_status: session_state,
             connection: connection_info,
-            connection_url: connection_info[:websocket] || connection_info['websocket']
+            connection_url: connection_url
           }
         rescue StandardError => e
           Rails.logger.error("Admin API: Error getting connection info: #{e.class} - #{e.message}")
@@ -457,6 +472,26 @@ module Api
             'queued'
           else
             'unknown'
+          end
+        end
+
+        # Build connection URL from connection info
+        # Supports multiple connection types (node, websocket, etc.)
+        def build_connection_url(connection_info)
+          # Handle both symbol and string keys
+          host = connection_info[:host] || connection_info['host']
+          port = connection_info[:port] || connection_info['port']
+          websocket = connection_info[:websocket] || connection_info['websocket']
+          
+          # For Kubernetes-based sessions (Jupyter, RStudio), use /node/host/port format
+          if host && port
+            "/node/#{host}/#{port}/"
+          # For VNC sessions, use websocket format
+          elsif websocket && host
+            "/rnode/#{host}/#{websocket}/websockify"
+          # Fallback: return nil if we can't determine URL
+          else
+            nil
           end
         end
       end
