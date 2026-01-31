@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
-require 'httparty'
+require 'net/http'
+require 'uri'
 require 'json'
 
 # Service class for sending webhooks to the Volume API when sessions terminate.
@@ -131,6 +132,7 @@ class VolumeWebhookService
     end
 
     # Send the webhook synchronously (called from background thread)
+    # Uses Net::HTTP (built into Ruby) instead of external gems
     #
     # @param volume_api_url [String] The base URL of the Volume API
     # @param payload [Hash] The webhook payload
@@ -138,39 +140,47 @@ class VolumeWebhookService
     # @return [void]
     def send_webhook_sync(volume_api_url, payload, session_id)
       webhook_url = "#{volume_api_url.chomp('/')}/api/v1/webhooks/session-ended"
-      
-      headers = {
-        'Content-Type' => 'application/json',
-        'Accept' => 'application/json'
-      }
-
-      # Add bearer token if configured
-      volume_api_token = ENV['VOLUME_API_TOKEN']
-      headers['Authorization'] = "Bearer #{volume_api_token}" if volume_api_token.present?
+      uri = URI.parse(webhook_url)
 
       Rails.logger.info("VolumeWebhookService: Sending session-ended webhook for session #{session_id} " \
                        "to #{webhook_url}")
 
-      response = HTTParty.post(
-        webhook_url,
-        body: payload.to_json,
-        headers: headers,
-        timeout: WEBHOOK_TIMEOUT
-      )
+      # Create HTTP connection
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == 'https')
+      http.open_timeout = WEBHOOK_TIMEOUT
+      http.read_timeout = WEBHOOK_TIMEOUT
+      
+      # Don't verify SSL for internal cluster communication
+      http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl?
 
-      if response.success?
+      # Build request
+      request = Net::HTTP::Post.new(uri.path)
+      request['Content-Type'] = 'application/json'
+      request['Accept'] = 'application/json'
+
+      # Add bearer token if configured
+      volume_api_token = ENV['VOLUME_API_TOKEN']
+      request['Authorization'] = "Bearer #{volume_api_token}" if volume_api_token.present?
+
+      request.body = payload.to_json
+
+      # Send request
+      response = http.request(request)
+
+      if response.is_a?(Net::HTTPSuccess)
         Rails.logger.info("VolumeWebhookService: Webhook sent successfully for session #{session_id} " \
                          "(status: #{response.code})")
       else
         Rails.logger.error("VolumeWebhookService: Webhook failed for session #{session_id} " \
                           "(status: #{response.code}, body: #{response.body})")
       end
-    rescue HTTParty::Error => e
-      Rails.logger.error("VolumeWebhookService: HTTP error sending webhook for session #{session_id}: " \
-                        "#{e.class} - #{e.message}")
-    rescue Timeout::Error => e
+    rescue Net::OpenTimeout, Net::ReadTimeout => e
       Rails.logger.error("VolumeWebhookService: Timeout sending webhook for session #{session_id}: " \
                         "#{e.message}")
+    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH => e
+      Rails.logger.error("VolumeWebhookService: Connection error sending webhook for session #{session_id}: " \
+                        "#{e.class} - #{e.message}")
     rescue StandardError => e
       Rails.logger.error("VolumeWebhookService: Error sending webhook for session #{session_id}: " \
                         "#{e.class} - #{e.message}")
