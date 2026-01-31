@@ -3,6 +3,8 @@
 # Admin API Controller for batch connect session management
 # This provides admin/service-level access to manage sessions for all users
 
+require_relative '../../../../services/volume_webhook_service'
+
 module Api
   module V1
     module BatchConnect
@@ -12,6 +14,10 @@ module Api
 
         # Authenticate admin API requests
         before_action :authenticate_admin_api_request
+
+        # Storage path validation pattern: alphanumeric, hyphens, underscores, forward slashes only
+        STORAGE_PATH_PATTERN = /\A[a-zA-Z0-9\/_-]+\z/.freeze
+        STORAGE_PATH_MAX_LENGTH = 255
 
         # GET /api/v1/batch_connect/sessions
         # List all batch connect sessions (optionally filtered by user)
@@ -68,12 +74,18 @@ module Api
         #   - app_token: batch connect app (e.g., "sys/bc_jupyter")
         #   - context: form parameters for the app
         #
+        # Optional body parameters (Volume Integration v1.1):
+        #   - storage_path: relative NFS path for volume mount
+        #   - volume_session_id: Volume API session ID for webhook linkage
+        #
         # Returns:
         # {
         #   "status": "success",
+        #   "id": "uuid",
         #   "session_id": "uuid",
         #   "user": "username",
         #   "job_id": "...",
+        #   "volume_session_id": "..." (if provided)
         #   ...
         # }
         def create
@@ -81,7 +93,22 @@ module Api
           app_token = params.require(:app_token)
           context_params = params.require(:context).permit!.to_hash
 
+          # Extract optional volume integration parameters
+          storage_path = params[:storage_path]
+          volume_session_id = params[:volume_session_id]
+
           Rails.logger.info("Admin API: Creating session for user #{target_user}")
+
+          # Validate storage_path if provided
+          if storage_path.present?
+            validation_error = validate_storage_path(storage_path)
+            if validation_error
+              return render json: {
+                status: 'error',
+                message: validation_error
+              }, status: :bad_request
+            end
+          end
 
           # Load the app
           app = ::BatchConnect::App.from_token(app_token)
@@ -97,6 +124,15 @@ module Api
           context = app.build_session_context
           context.attributes = context_params
 
+          # Pass volume integration parameters to context for template use
+          if storage_path.present? || volume_session_id.present?
+            context_params['storage_path'] = storage_path if storage_path.present?
+            context_params['volume_session_id'] = volume_session_id if volume_session_id.present?
+            context_params['nfs_base'] = ENV['NFS_BASE'] if ENV['NFS_BASE'].present?
+            context_params['project_mount_path'] = ENV['PROJECT_MOUNT_PATH'] || '/mnt/project'
+            context.attributes = context_params
+          end
+
           unless context.valid?
             return render json: {
               status: 'error',
@@ -105,20 +141,29 @@ module Api
             }, status: :unprocessable_entity
           end
 
-          # Create session for user
+          # Create session for user with volume metadata
           session = create_session_for_user(target_user, app, context)
 
           if session
+            # Store volume metadata in session info for later retrieval
+            store_volume_metadata(session, storage_path, volume_session_id)
+
             Rails.logger.info("Admin API: Created session #{session.id} for user #{target_user}")
 
-            render json: {
+            response_data = {
               status: 'success',
+              id: session.id,
               session_id: session.id,
               user: target_user,
               job_id: session.job_id,
               created_at: session.created_at,
               session_url: "/batch_connect/sessions/#{session.id}"
-            }, status: :created
+            }
+
+            # Include volume_session_id in response if provided
+            response_data[:volume_session_id] = volume_session_id if volume_session_id.present?
+
+            render json: response_data, status: :created
           else
             render json: {
               status: 'error',
@@ -170,20 +215,27 @@ module Api
             end
           end
 
+          # Build session response with volume integration fields
+          session_data = {
+            id: session.id,
+            user: user,
+            job_id: session.job_id,
+            created_at: session.created_at,
+            title: session.title,
+            cluster_id: session.cluster_id,
+            token: session.token,
+            info: session.info.to_h,
+            status: session_status(session),
+            connect_url: connection_url
+          }
+
+          # Include volume_session_id if present (FR-2)
+          vol_session_id = session_volume_id(session)
+          session_data[:volume_session_id] = vol_session_id if vol_session_id.present?
+
           render json: {
             status: 'success',
-            session: {
-              id: session.id,
-              user: user,
-              job_id: session.job_id,
-              created_at: session.created_at,
-              title: session.title,
-              cluster_id: session.cluster_id,
-              token: session.token,
-              info: session.info.to_h,
-              status: session_status(session),
-              connect_url: connection_url
-            }
+            session: session_data
           }
 
         rescue StandardError => e
@@ -245,6 +297,7 @@ module Api
 
         # DELETE /api/v1/batch_connect/sessions/:id
         # Delete a session (for any user)
+        # Sends webhook to Volume API if volume_session_id was set (FR-3)
         def destroy
           session_info = find_session_by_id(params[:id])
 
@@ -259,6 +312,10 @@ module Api
           user = session_info[:user]
 
           begin
+            # Send webhook before destroying session (FR-3)
+            # This is fire-and-forget - failures don't affect session cleanup
+            send_session_ended_webhook(session, 'cancelled', 'User terminated session via API')
+
             session.destroy
             Rails.logger.info("Admin API: Deleted session #{params[:id]} for user #{user}")
 
@@ -277,15 +334,58 @@ module Api
         end
 
         # GET /api/v1/batch_connect/apps
+        # GET /api/v1/batch_connect/sessions/apps
         # List available batch connect apps
+        # 
+        # Query parameters:
+        #   - details: (optional) if true, include form attributes for all apps
+        # 
+        # Returns basic app info by default, or detailed info with form attributes if details=true
         def apps
+          include_details = params[:details] == 'true'
+          
           apps = SysRouter.apps.select { |app| app.type == :sys && app.name.start_with?("bc_") }.map do |app|
-            {
+            app_data = {
               token: app.token,
               title: app.title,
               description: (app.manifest.description rescue ""),
               icon_uri: (app.icon_uri rescue "")
             }
+            
+            if include_details
+              begin
+                bc_app = ::BatchConnect::App.from_token(app.token)
+                if bc_app && bc_app.valid?
+                  attributes_data = bc_app.attributes.map do |attr|
+                    attribute_hash = {
+                      id: attr.id.to_s,
+                      label: attr.label,
+                      widget: attr.widget,
+                      required: attr.required?,
+                      value: attr.value,
+                      help: attr.help
+                    }
+                    
+                    # Add widget-specific fields
+                    case attr.widget
+                    when 'select', 'radio_button'
+                      attribute_hash[:options] = attr.options if attr.respond_to?(:options)
+                    when 'number_field'
+                      attribute_hash[:min] = attr.min if attr.respond_to?(:min)
+                      attribute_hash[:max] = attr.max if attr.respond_to?(:max)
+                      attribute_hash[:step] = attr.step if attr.respond_to?(:step)
+                    end
+                    
+                    attribute_hash
+                  end
+                  app_data[:attributes] = attributes_data
+                end
+              rescue => e
+                Rails.logger.warn("Admin API: Could not get attributes for #{app.token}: #{e.message}")
+              end
+            end
+            
+            app_data
           end
 
           render json: {
@@ -294,6 +394,94 @@ module Api
           }
         rescue StandardError => e
           Rails.logger.error("Admin API: Error listing apps: #{e.class} - #{e.message}")
+          render json: {
+            status: 'error',
+            message: e.message
+          }, status: :internal_server_error
+        end
+
+        # GET /api/v1/batch_connect/sessions/app_details?token=sys/bc_jupyter
+        # Get detailed information about a specific app including form attributes
+        #
+        # Query parameters:
+        #   - token: app token (e.g., "sys/bc_jupyter")
+        #
+        # Returns:
+        # {
+        #   "status": "success",
+        #   "app": {
+        #     "token": "sys/bc_jupyter",
+        #     "title": "Jupyter (Kubernetes)",
+        #     "description": "...",
+        #     "icon_uri": "...",
+        #     "attributes": [
+        #       {
+        #         "id": "project",
+        #         "label": "Project",
+        #         "widget": "text_field",
+        #         "required": true,
+        #         "value": null,
+        #         "options": null
+        #       },
+        #       ...
+        #     ]
+        #   }
+        # }
+        def app_details
+          token = params.require(:token)
+          
+          Rails.logger.info("Admin API: Getting details for app #{token}")
+          
+          app = ::BatchConnect::App.from_token(token)
+          unless app && app.valid?
+            return render json: {
+              status: 'error',
+              message: "Batch connect app not found: #{token}"
+            }, status: :not_found
+          end
+
+          # Build attributes with metadata
+          attributes_data = app.attributes.map do |attr|
+            attribute_hash = {
+              id: attr.id.to_s,
+              label: attr.label,
+              widget: attr.widget,
+              required: attr.required?,
+              value: attr.value,
+              help: attr.help
+            }
+            
+            # Add widget-specific fields
+            case attr.widget
+            when 'select', 'radio_button'
+              attribute_hash[:options] = attr.options if attr.respond_to?(:options)
+            when 'number_field'
+              attribute_hash[:min] = attr.min if attr.respond_to?(:min)
+              attribute_hash[:max] = attr.max if attr.respond_to?(:max)
+              attribute_hash[:step] = attr.step if attr.respond_to?(:step)
+            end
+            
+            attribute_hash
+          end
+
+          render json: {
+            status: 'success',
+            app: {
+              token: app.token,
+              title: app.title,
+              description: app.description,
+              icon_uri: app.icon_uri,
+              attributes: attributes_data
+            }
+          }
+        rescue ActionController::ParameterMissing => e
+          render json: {
+            status: 'error',
+            message: "Missing required parameter: #{e.param}"
+          }, status: :bad_request
+        rescue StandardError => e
+          Rails.logger.error("Admin API: Error getting app details: #{e.class} - #{e.message}")
+          Rails.logger.error("Admin API: Backtrace: #{e.backtrace.join("\n")}")
           render json: {
             status: 'error',
             message: e.message
@@ -493,6 +681,94 @@ module Api
           else
             nil
           end
+        end
+
+        # Validate storage path for security
+        # Returns error message if invalid, nil if valid
+        #
+        # @param storage_path [String] The storage path to validate
+        # @return [String, nil] Error message or nil if valid
+        def validate_storage_path(storage_path)
+          # Check max length
+          if storage_path.length > STORAGE_PATH_MAX_LENGTH
+            return "Invalid storage_path: must be #{STORAGE_PATH_MAX_LENGTH} characters or less"
+          end
+
+          # Check for absolute paths (must be relative)
+          if storage_path.start_with?('/')
+            return 'Invalid storage_path: must be relative (no leading slash)'
+          end
+
+          # Check for directory traversal attempts
+          if storage_path.include?('..')
+            return 'Invalid storage_path: cannot contain parent directory references (..)'
+          end
+
+          # Check pattern (alphanumeric, hyphens, underscores, forward slashes only)
+          unless storage_path.match?(STORAGE_PATH_PATTERN)
+            return 'Invalid storage_path: must contain only alphanumeric characters, hyphens, underscores, and forward slashes'
+          end
+
+          nil # Valid
+        end
+
+        # Store volume metadata in session info
+        #
+        # @param session [BatchConnect::Session] The session to update
+        # @param storage_path [String, nil] The storage path
+        # @param volume_session_id [String, nil] The volume session ID
+        def store_volume_metadata(session, storage_path, volume_session_id)
+          return unless storage_path.present? || volume_session_id.present?
+
+          begin
+            # Get existing info hash
+            info = session.info.to_h rescue {}
+            
+            # Add volume metadata
+            info[:storage_path] = storage_path if storage_path.present?
+            info[:volume_session_id] = volume_session_id if volume_session_id.present?
+            
+            # Update session info
+            # Note: OOD Session stores info in the session file
+            if session.respond_to?(:info=)
+              session.info = info
+            end
+
+            Rails.logger.debug("Admin API: Stored volume metadata for session #{session.id}: " \
+                              "storage_path=#{storage_path}, volume_session_id=#{volume_session_id}")
+          rescue StandardError => e
+            Rails.logger.warn("Admin API: Could not store volume metadata for session #{session.id}: #{e.message}")
+          end
+        end
+
+        # Get volume_session_id from session info
+        #
+        # @param session [BatchConnect::Session] The session
+        # @return [String, nil] The volume session ID if present
+        def session_volume_id(session)
+          info = session.info.to_h rescue {}
+          info[:volume_session_id] || info['volume_session_id']
+        end
+
+        # Send session-ended webhook to Volume API (FR-3)
+        # This is fire-and-forget - failures are logged but don't affect session cleanup
+        #
+        # @param session [BatchConnect::Session] The session that ended
+        # @param exit_status [String] The exit status (completed, failed, timeout, cancelled, unknown)
+        # @param exit_reason [String] Human-readable reason for termination
+        def send_session_ended_webhook(session, exit_status, exit_reason)
+          # Determine exit status from session if not explicitly provided
+          exit_status = VolumeWebhookService.determine_exit_status(session) if exit_status.nil?
+
+          # Send the webhook asynchronously
+          VolumeWebhookService.send_session_ended(
+            session,
+            exit_status,
+            exit_reason: exit_reason
+          )
+        rescue StandardError => e
+          # Log error but don't fail - webhook is fire-and-forget
+          Rails.logger.error("Admin API: Error sending webhook for session #{session.id}: #{e.message}")
         end
       end
     end
