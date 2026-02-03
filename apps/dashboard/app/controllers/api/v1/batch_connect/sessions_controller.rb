@@ -42,15 +42,18 @@ module Api
           end
 
           sessions_data = sessions.map do |session_info|
+            session = session_info[:session]
+            user_context = session.user_context rescue {}
             {
-              id: session_info[:session].id,
+              id: session.id,
               user: session_info[:user],
-              job_id: session_info[:session].job_id,
-              title: session_info[:session].title,
-              status: session_status(session_info[:session]),
-              created_at: session_info[:session].created_at,
-              cluster_id: session_info[:session].cluster_id,
-              token: session_info[:session].token
+              job_id: session.job_id,
+              title: session.title,
+              status: session_status(session),
+              created_at: session.created_at,
+              cluster_id: session.cluster_id,
+              token: session.token,
+              project: user_context['project']
             }
           end
 
@@ -359,21 +362,22 @@ module Api
                   attributes_data = bc_app.attributes.map do |attr|
                     attribute_hash = {
                       id: attr.id.to_s,
-                      label: attr.label,
-                      widget: attr.widget,
-                      required: attr.required?,
-                      value: attr.value,
-                      help: attr.help
+                      label: (attr.respond_to?(:label) ? attr.label : attr.id.to_s),
+                      widget: (attr.respond_to?(:widget) ? attr.widget : 'text_field'),
+                      required: (attr.respond_to?(:required?) ? attr.required? : (attr.opts[:required] rescue false)),
+                      value: (attr.respond_to?(:value) ? attr.value : nil),
+                      help: (attr.respond_to?(:help) ? attr.help : nil)
                     }
                     
                     # Add widget-specific fields
-                    case attr.widget
+                    widget = attribute_hash[:widget]
+                    case widget
                     when 'select', 'radio_button'
-                      attribute_hash[:options] = attr.options if attr.respond_to?(:options)
+                      attribute_hash[:options] = attr.opts[:options] if attr.opts[:options]
                     when 'number_field'
-                      attribute_hash[:min] = attr.min if attr.respond_to?(:min)
-                      attribute_hash[:max] = attr.max if attr.respond_to?(:max)
-                      attribute_hash[:step] = attr.step if attr.respond_to?(:step)
+                      attribute_hash[:min] = attr.opts[:min] if attr.opts[:min]
+                      attribute_hash[:max] = attr.opts[:max] if attr.opts[:max]
+                      attribute_hash[:step] = attr.opts[:step] if attr.opts[:step]
                     end
                     
                     attribute_hash
@@ -444,21 +448,22 @@ module Api
           attributes_data = app.attributes.map do |attr|
             attribute_hash = {
               id: attr.id.to_s,
-              label: attr.label,
-              widget: attr.widget,
-              required: attr.required?,
-              value: attr.value,
-              help: attr.help
+              label: (attr.respond_to?(:label) ? attr.label : attr.id.to_s),
+              widget: (attr.respond_to?(:widget) ? attr.widget : 'text_field'),
+              required: (attr.respond_to?(:required?) ? attr.required? : (attr.opts[:required] rescue false)),
+              value: (attr.respond_to?(:value) ? attr.value : nil),
+              help: (attr.respond_to?(:help) ? attr.help : nil)
             }
             
             # Add widget-specific fields
-            case attr.widget
+            widget = attribute_hash[:widget]
+            case widget
             when 'select', 'radio_button'
-              attribute_hash[:options] = attr.options if attr.respond_to?(:options)
+              attribute_hash[:options] = attr.opts[:options] if attr.opts[:options]
             when 'number_field'
-              attribute_hash[:min] = attr.min if attr.respond_to?(:min)
-              attribute_hash[:max] = attr.max if attr.respond_to?(:max)
-              attribute_hash[:step] = attr.step if attr.respond_to?(:step)
+              attribute_hash[:min] = attr.opts[:min] if attr.opts[:min]
+              attribute_hash[:max] = attr.opts[:max] if attr.opts[:max]
+              attribute_hash[:step] = attr.opts[:step] if attr.opts[:step]
             end
             
             attribute_hash

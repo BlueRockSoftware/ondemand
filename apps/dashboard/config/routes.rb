@@ -13,6 +13,7 @@ Rails.application.routes.draw do
           end
           collection do
             get :apps
+            get :app_details
           end
         end
       end
