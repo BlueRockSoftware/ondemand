@@ -3,6 +3,7 @@
 # Admin API Controller for batch connect session management
 # This provides admin/service-level access to manage sessions for all users
 
+require 'etc'
 require_relative '../../../../services/volume_webhook_service'
 
 module Api
@@ -44,9 +45,11 @@ module Api
           sessions_data = sessions.map do |session_info|
             session = session_info[:session]
             user_context = session.user_context rescue {}
+            # Use target_user if set (admin-created sessions), otherwise use directory owner
+            effective_user = user_context['target_user'] || session_info[:user]
             {
               id: session.id,
-              user: session_info[:user],
+              user: effective_user,
               job_id: session.job_id,
               title: session.title,
               status: session_status(session),
@@ -555,13 +558,38 @@ module Api
         end
 
         # List sessions for a specific user
+        # This includes:
+        # 1. Sessions in the user's own dataroot
+        # 2. Sessions created by admin API with target_user matching this user
         def list_user_sessions(username)
+          sessions = []
+
+          # First, get sessions from user's own dataroot
           user_dataroot = get_user_dataroot(username)
           batch_connect_dir = user_dataroot.join('batch_connect')
+          if batch_connect_dir.exist?
+            sessions.concat(load_user_sessions_from_dataroot(batch_connect_dir, username))
+          end
 
-          return [] unless batch_connect_dir.exist?
+          # Also check all sessions for any with target_user matching this user
+          # (admin-created sessions are stored in admin's dataroot with target_user metadata)
+          all_sessions = list_all_sessions
+          all_sessions.each do |session_info|
+            session = session_info[:session]
+            target_user = session_target_user(session)
+            if target_user == username && session_info[:user] != username
+              # This is an admin-created session for this user
+              sessions << { user: username, session: session }
+            end
+          end
 
-          load_user_sessions_from_dataroot(batch_connect_dir, username)
+          sessions
+        end
+
+        # Get target_user from session context (for admin-created sessions)
+        def session_target_user(session)
+          context = session.user_context rescue {}
+          context['target_user']
         end
 
         # Load sessions from a user's batch_connect directory
@@ -618,15 +646,174 @@ module Api
         end
 
         # Create session for a specific user
+        # The session is created in the admin user's dataroot but tagged with target_user metadata
+        # When listing sessions, we filter by target_user to show the correct sessions
         def create_session_for_user(username, app, context)
-          # Use the existing Session.save method but need to set up user context
+          # Create session using the normal method (saves to admin's dataroot)
           session = ::BatchConnect::Session.new
-          session.save(app: app, context: context)
+          save_result = session.save(app: app, context: context)
+          
+          unless save_result
+            Rails.logger.error("Admin API: Session save failed for user #{username}")
+            return nil
+          end
+
+          # Store target_user in the user_defined_context file
+          # This allows us to filter sessions by target_user when listing
+          store_target_user_metadata(session, username)
+
+          Rails.logger.info("Admin API: Created session #{session.id} for target user #{username}")
           session
         rescue StandardError => e
           Rails.logger.error("Admin API: Error creating session for user #{username}: #{e.message}")
           Rails.logger.error("Admin API: Backtrace: #{e.backtrace.join("\n")}")
           nil
+        end
+
+        # Store target_user in session's user context file
+        def store_target_user_metadata(session, target_user)
+          begin
+            context_file = session.staged_root.join("user_defined_context.json")
+            if context_file.exist?
+              context_data = JSON.parse(context_file.read)
+            else
+              context_data = {}
+            end
+            
+            context_data['target_user'] = target_user
+            context_file.write(JSON.pretty_generate(context_data))
+            Rails.logger.debug("Admin API: Stored target_user=#{target_user} in session #{session.id}")
+          rescue StandardError => e
+            Rails.logger.warn("Admin API: Could not store target_user metadata: #{e.message}")
+          end
+        end
+
+        # Move session files from admin's dataroot to target user's dataroot
+        # This ensures the session appears in the correct user's session list
+        def move_session_to_user(session, username)
+          admin_db_file = session.db_file
+          admin_staged_root = session.staged_root
+
+          # Calculate target user's paths
+          user_dataroot = get_user_dataroot(username)
+          user_batch_connect_dir = user_dataroot.join('batch_connect')
+          
+          # Determine cluster for per-cluster dataroot (if enabled)
+          # Use the session's staged_root to determine the correct cluster path format
+          # This handles the per_cluster_dataroot configuration automatically
+          cluster_path = ''
+          begin
+            # Check if per_cluster_dataroot is enabled by comparing staged_root pattern
+            if ::Configuration.respond_to?(:per_cluster_dataroot?) && ::Configuration.per_cluster_dataroot?
+              cluster_path = session.cluster_id.to_s
+            end
+          rescue => e
+            Rails.logger.debug("Admin API: Could not determine per_cluster_dataroot setting: #{e.message}")
+          end
+          
+          user_session_dataroot = user_batch_connect_dir.join(cluster_path).join(session.token.to_s)
+          user_db_root = user_session_dataroot.join('db')
+          user_output_root = user_session_dataroot.join('output')
+
+          Rails.logger.info("Admin API: Moving session #{session.id} from admin to user #{username}")
+          Rails.logger.debug("Admin API: Source db_file: #{admin_db_file}")
+          Rails.logger.debug("Admin API: Source staged_root: #{admin_staged_root}")
+          Rails.logger.debug("Admin API: Target db_root: #{user_db_root}")
+          Rails.logger.debug("Admin API: Target output_root: #{user_output_root}")
+
+          # Create target directories with proper permissions using sudo
+          # The PUN runs as the admin user, so we need elevated privileges to create dirs in other users' homes
+          create_user_directory(user_db_root, username)
+          create_user_directory(user_output_root, username)
+
+          # Move the database file (session metadata) using sudo
+          target_db_file = user_db_root.join(session.id)
+          if admin_db_file.exist?
+            result = system("sudo mv '#{admin_db_file}' '#{target_db_file}'")
+            if result
+              Rails.logger.debug("Admin API: Moved db file to #{target_db_file}")
+            else
+              Rails.logger.error("Admin API: Failed to move db file to #{target_db_file}")
+              return false
+            end
+          else
+            Rails.logger.warn("Admin API: Source db_file does not exist: #{admin_db_file}")
+          end
+
+          # Move the staged output directory (job scripts, connection info, etc.) using sudo
+          target_staged_root = user_output_root.join(session.id)
+          if admin_staged_root.exist?
+            result = system("sudo mv '#{admin_staged_root}' '#{target_staged_root}'")
+            if result
+              Rails.logger.debug("Admin API: Moved staged_root to #{target_staged_root}")
+            else
+              Rails.logger.error("Admin API: Failed to move staged_root to #{target_staged_root}")
+              return false
+            end
+          else
+            Rails.logger.warn("Admin API: Source staged_root does not exist: #{admin_staged_root}")
+          end
+
+          # Set ownership to target user
+          set_user_ownership(target_db_file, username)
+          set_user_ownership(target_staged_root, username)
+
+          Rails.logger.info("Admin API: Successfully moved session #{session.id} to user #{username}")
+          true
+        rescue StandardError => e
+          Rails.logger.error("Admin API: Error moving session to user #{username}: #{e.message}")
+          Rails.logger.error("Admin API: Backtrace: #{e.backtrace.join("\n")}")
+          false
+        end
+
+        # Create directory with sudo and set ownership to specified user
+        # Returns true if successful, false otherwise
+        def create_user_directory(path, username)
+          return true if path.exist?
+
+          begin
+            # Use sudo to create directory and set ownership
+            cmd = "sudo mkdir -p '#{path}' && sudo chmod 700 '#{path}'"
+            result = system(cmd)
+            
+            unless result
+              Rails.logger.error("Admin API: Failed to create directory #{path}")
+              return false
+            end
+
+            # Set ownership using sudo chown
+            set_user_ownership(path, username)
+            true
+          rescue StandardError => e
+            Rails.logger.error("Admin API: Error creating directory #{path}: #{e.message}")
+            false
+          end
+        end
+
+        # Set ownership of path to specified user using sudo
+        # This is needed so the user can access their session files
+        def set_user_ownership(path, username)
+          return unless path.exist?
+
+          begin
+            # Get user's uid/gid from passwd
+            user_info = Etc.getpwnam(username)
+            
+            # Use sudo to change ownership since we may not have permission
+            cmd = "sudo chown -R #{user_info.uid}:#{user_info.gid} '#{path}'"
+            result = system(cmd)
+            
+            if result
+              Rails.logger.debug("Admin API: Set ownership of #{path} to #{username} (#{user_info.uid}:#{user_info.gid})")
+            else
+              Rails.logger.warn("Admin API: sudo chown failed for #{path}")
+            end
+          rescue ArgumentError => e
+            # User not found in passwd - this is expected if running without proper user database
+            Rails.logger.warn("Admin API: Could not set ownership for #{username}: #{e.message}")
+          rescue StandardError => e
+            Rails.logger.warn("Admin API: Error setting ownership: #{e.message}")
+          end
         end
 
         # Get the base dataroot that contains all user directories
