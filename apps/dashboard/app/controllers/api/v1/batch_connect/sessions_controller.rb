@@ -17,6 +17,7 @@ require 'etc'
 require 'net/http'
 require 'uri'
 require 'json'
+require 'ostruct'
 require_relative '../../../../services/volume_webhook_service'
 require_relative '../../../../services/pun_manager'
 
@@ -600,32 +601,121 @@ module Api
         end
 
         # List sessions for a specific user
-        # This includes:
-        # 1. Sessions in the user's own dataroot
-        # 2. Sessions created by admin API with target_user matching this user
+        # 
+        # Uses impersonation to read sessions from the target user's PUN context,
+        # ensuring proper file permissions are respected.
         def list_user_sessions(username)
+          # Use impersonation if enabled and target user differs from current PUN user
+          if should_impersonate_for_list?(username)
+            return list_sessions_via_impersonation(username)
+          end
+
+          # Fallback: direct file read (only works if current user can read target's files)
           sessions = []
 
-          # First, get sessions from user's own dataroot
           user_dataroot = get_user_dataroot(username)
           batch_connect_dir = user_dataroot.join('batch_connect')
           if batch_connect_dir.exist?
             sessions.concat(load_user_sessions_from_dataroot(batch_connect_dir, username))
           end
 
-          # Also check all sessions for any with target_user matching this user
-          # (admin-created sessions are stored in admin's dataroot with target_user metadata)
-          all_sessions = list_all_sessions
-          all_sessions.each do |session_info|
-            session = session_info[:session]
-            target_user = session_target_user(session)
-            if target_user == username && session_info[:user] != username
-              # This is an admin-created session for this user
-              sessions << { user: username, session: session }
-            end
+          sessions
+        end
+
+        # Check if we should use impersonation for listing sessions
+        def should_impersonate_for_list?(target_user)
+          return false unless PunManager.impersonation_enabled?
+
+          current_pun_user = get_current_pun_user
+          target_user != current_pun_user
+        end
+
+        # List sessions via Apache-mediated impersonation
+        def list_sessions_via_impersonation(username)
+          Rails.logger.info("Admin API: Listing sessions for #{username} via impersonation")
+
+          # Validate user exists
+          PunManager.validate_user(username)
+
+          # Forward request through Apache to target user's PUN
+          response = forward_list_request_via_apache(username)
+
+          # Parse response
+          handle_list_impersonation_response(response, username)
+
+        rescue PunManager::UserNotFoundError => e
+          Rails.logger.error("Admin API: Impersonation failed for list - #{e.message}")
+          []
+        rescue StandardError => e
+          Rails.logger.error("Admin API: Error listing sessions via impersonation: #{e.message}")
+          []
+        end
+
+        # Forward list request through Apache to target user's PUN
+        def forward_list_request_via_apache(target_user)
+          uri = URI('http://127.0.0.1/pun/sys/dashboard/internal/batch_connect/sessions')
+
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.open_timeout = 10
+          http.read_timeout = 30
+
+          request = Net::HTTP::Get.new(uri.path)
+          request['Accept'] = 'application/json'
+
+          # Set Host header to match Apache's ServerName
+          begin
+            original_host = self.request.host_with_port
+          rescue
+            original_host = ENV['OOD_SERVER_NAME'] || 'localhost'
+          end
+          request['Host'] = original_host
+
+          # Impersonation headers
+          request['X-Impersonate-User'] = target_user
+          request['X-Internal-Token'] = PunManager.internal_api_token
+
+          Rails.logger.debug("Admin API: Forwarding list request to Apache for user #{target_user}")
+          http.request(request)
+        end
+
+        # Handle response from list impersonation request
+        def handle_list_impersonation_response(response, username)
+          unless response.is_a?(Net::HTTPSuccess)
+            Rails.logger.error("Admin API: List impersonation failed: #{response.code} #{response.message}")
+            return []
           end
 
-          sessions
+          data = parse_json_response(response.body)
+          unless data && data['status'] == 'success'
+            Rails.logger.error("Admin API: List impersonation response missing success status")
+            return []
+          end
+
+          # Convert response data to session_info format expected by caller
+          (data['sessions'] || []).map do |session_data|
+            # Create a mock session object that responds to the methods we need
+            session = OpenStruct.new(
+              id: session_data['id'],
+              job_id: session_data['job_id'],
+              title: session_data['title'],
+              created_at: session_data['created_at'],
+              cluster_id: session_data['cluster_id'],
+              token: session_data['token']
+            )
+
+            # Add user_context method that returns project info
+            session.define_singleton_method(:user_context) do
+              { 'project' => session_data['project'] }
+            end
+
+            # Add status-related methods
+            status = session_data['status']
+            session.define_singleton_method(:completed?) { status == 'completed' }
+            session.define_singleton_method(:running?) { status == 'running' }
+            session.define_singleton_method(:queued?) { status == 'queued' }
+
+            { user: username, session: session }
+          end
         end
 
         # Get target_user from session context (for admin-created sessions)

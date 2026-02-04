@@ -17,6 +17,46 @@ module Internal
       before_action :verify_internal_access
       before_action :verify_internal_token
 
+      # GET /internal/batch_connect/sessions
+      # List sessions for the current PUN user
+      #
+      # This endpoint is called by the Admin API during impersonation.
+      # Returns all sessions belonging to the PUN user.
+      def index
+        current_user = OodSupport::User.new
+
+        Rails.logger.info("Internal API: Listing sessions for PUN user #{current_user.name}")
+
+        sessions = ::BatchConnect::Session.all.map do |session|
+          user_context = session.user_context rescue {}
+          {
+            id: session.id,
+            user: current_user.name,
+            job_id: session.job_id,
+            title: session.title,
+            status: session_status(session),
+            created_at: session.created_at,
+            cluster_id: session.cluster_id,
+            token: session.token,
+            project: user_context['project']
+          }
+        end
+
+        render json: {
+          status: 'success',
+          sessions: sessions,
+          user: current_user.name
+        }
+
+      rescue StandardError => e
+        Rails.logger.error("Internal API: Error listing sessions: #{e.class} - #{e.message}")
+        render json: {
+          status: 'error',
+          code: 'INTERNAL_ERROR',
+          message: e.message
+        }, status: :internal_server_error
+      end
+
       # POST /internal/batch_connect/sessions
       # Create a session in the context of the current PUN user
       #
@@ -192,6 +232,17 @@ module Internal
             message: 'Invalid internal API token'
           }, status: :forbidden
         end
+      end
+
+      # Get human-readable session status
+      def session_status(session)
+        return 'completed' if session.completed?
+        return 'running' if session.running?
+        return 'queued' if session.queued?
+
+        'unknown'
+      rescue StandardError
+        'unknown'
       end
     end
   end
