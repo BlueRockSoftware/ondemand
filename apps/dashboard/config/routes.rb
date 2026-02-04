@@ -20,6 +20,14 @@ Rails.application.routes.draw do
     end
   end
 
+  # Internal API routes - for PUN-to-PUN communication during user impersonation
+  # These endpoints are only accessible from localhost
+  namespace :internal do
+    namespace :batch_connect do
+      resources :sessions, only: [:create, :destroy]
+    end
+  end
+
   if Configuration.can_access_projects?
     resources :projects do
       root 'projects#index'
