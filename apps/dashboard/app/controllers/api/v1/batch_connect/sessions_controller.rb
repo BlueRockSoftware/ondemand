@@ -2,9 +2,15 @@
 
 # Admin API Controller for batch connect session management
 # This provides admin/service-level access to manage sessions for all users
+#
+# Supports user impersonation via PUN forwarding:
+# When target_user differs from the current PUN user, requests are forwarded
+# to the target user's PUN to ensure sessions run in the correct context.
 
 require 'etc'
 require_relative '../../../../services/volume_webhook_service'
+require_relative '../../../../services/pun_manager'
+require_relative '../../../../../lib/unix_socket_http'
 
 module Api
   module V1
@@ -182,6 +188,41 @@ module Api
             status: 'error',
             message: "Missing required parameter: #{e.param}"
           }, status: :bad_request
+
+        rescue PunManager::UserNotFoundError => e
+          render json: {
+            status: 'error',
+            code: 'USER_NOT_FOUND',
+            message: e.message
+          }, status: :not_found
+
+        rescue PunManager::PunStartupError => e
+          render json: {
+            status: 'error',
+            code: 'PUN_START_FAILED',
+            message: e.message
+          }, status: :service_unavailable
+
+        rescue PunManager::PunTimeoutError => e
+          render json: {
+            status: 'error',
+            code: 'PUN_TIMEOUT',
+            message: e.message
+          }, status: :gateway_timeout
+
+        rescue UnixSocketHttp::ConnectionError => e
+          render json: {
+            status: 'error',
+            code: 'PUN_CONNECTION_FAILED',
+            message: e.message
+          }, status: :bad_gateway
+
+        rescue UnixSocketHttp::TimeoutError => e
+          render json: {
+            status: 'error',
+            code: 'PUN_REQUEST_TIMEOUT',
+            message: e.message
+          }, status: :gateway_timeout
 
         rescue StandardError => e
           Rails.logger.error("Admin API: Error creating session: #{e.class} - #{e.message}")
@@ -646,10 +687,179 @@ module Api
         end
 
         # Create session for a specific user
-        # The session is created in the admin user's dataroot but tagged with target_user metadata
-        # When listing sessions, we filter by target_user to show the correct sessions
+        # 
+        # If impersonation is enabled and target_user differs from the current PUN user,
+        # the request is forwarded to the target user's PUN to create the session in
+        # the correct context. This ensures pods run in the target user's namespace.
+        #
+        # If impersonation is disabled or not needed, falls back to the legacy behavior
+        # of creating in admin's dataroot with target_user metadata.
         def create_session_for_user(username, app, context)
-          # Create session using the normal method (saves to admin's dataroot)
+          current_pun_user = get_current_pun_user
+
+          # Check if we should use impersonation
+          if should_impersonate?(username, current_pun_user)
+            Rails.logger.info("Admin API: Using impersonation to create session for #{username} (current PUN: #{current_pun_user})")
+            return create_session_via_impersonation(username, app.token, context)
+          end
+
+          # Fall back to legacy behavior (same user or impersonation disabled)
+          Rails.logger.info("Admin API: Creating session locally for #{username}")
+          create_session_locally(username, app, context)
+        rescue StandardError => e
+          Rails.logger.error("Admin API: Error creating session for user #{username}: #{e.message}")
+          Rails.logger.error("Admin API: Backtrace: #{e.backtrace.join("\n")}")
+          nil
+        end
+
+        # Get the current PUN user (the user whose PUN is handling this request)
+        def get_current_pun_user
+          OodSupport::User.new.name
+        rescue StandardError
+          ENV['USER'] || 'unknown'
+        end
+
+        # Determine if we should use impersonation for this request
+        def should_impersonate?(target_user, current_pun_user)
+          # Impersonation must be enabled
+          return false unless PunManager.impersonation_enabled?
+
+          # Internal API token must be configured
+          return false if PunManager.internal_api_token.blank?
+
+          # Only impersonate if target differs from current
+          target_user != current_pun_user
+        end
+
+        # Create session via PUN forwarding (impersonation)
+        #
+        # This method:
+        # 1. Ensures the target user's PUN is running
+        # 2. Forwards the session creation request to the target user's PUN
+        # 3. Returns the session created by the target PUN
+        def create_session_via_impersonation(username, app_token, context)
+          # Log the impersonation attempt
+          log_impersonation_attempt('create_session', username)
+
+          # Ensure target user's PUN is running
+          socket_path = PunManager.ensure_running(username)
+          Rails.logger.info("Admin API: Target PUN socket ready: #{socket_path}")
+
+          # Build request payload for internal API
+          payload = {
+            app_token: app_token,
+            context: context.respond_to?(:to_h) ? context.to_h : context.attributes
+          }
+
+          # Add volume integration parameters if present
+          if context.respond_to?(:attributes)
+            attrs = context.attributes
+            payload[:storage_path] = attrs['storage_path'] if attrs['storage_path'].present?
+            payload[:volume_session_id] = attrs['volume_session_id'] if attrs['volume_session_id'].present?
+          end
+
+          # Forward request to target user's PUN
+          response = forward_create_request(socket_path, payload)
+
+          # Parse response and create session object
+          handle_impersonation_response(response, username)
+
+        rescue PunManager::UserNotFoundError => e
+          Rails.logger.error("Admin API: Impersonation failed - #{e.message}")
+          log_impersonation_failure('create_session', username, 'USER_NOT_FOUND', e.message)
+          raise
+        rescue PunManager::PunStartupError => e
+          Rails.logger.error("Admin API: Impersonation failed - #{e.message}")
+          log_impersonation_failure('create_session', username, 'PUN_START_FAILED', e.message)
+          raise
+        rescue PunManager::PunTimeoutError => e
+          Rails.logger.error("Admin API: Impersonation failed - #{e.message}")
+          log_impersonation_failure('create_session', username, 'PUN_TIMEOUT', e.message)
+          raise
+        rescue UnixSocketHttp::SocketError => e
+          Rails.logger.error("Admin API: Impersonation failed - #{e.message}")
+          log_impersonation_failure('create_session', username, 'SOCKET_ERROR', e.message)
+          raise
+        end
+
+        # Forward session creation request to target PUN via Unix socket
+        def forward_create_request(socket_path, payload)
+          client = UnixSocketHttp.new(socket_path, timeout: 60)
+
+          headers = {
+            'X-Internal-Token' => PunManager.internal_api_token
+          }
+
+          response = client.post('/pun/sys/dashboard/internal/batch_connect/sessions', payload, headers)
+
+          Rails.logger.debug("Admin API: Internal API response: #{response.code} #{response.message}")
+          response
+        end
+
+        # Handle response from impersonation request
+        def handle_impersonation_response(response, username)
+          unless response.success?
+            error_data = response.json || {}
+            error_msg = error_data['message'] || "Internal API returned #{response.code}"
+            Rails.logger.error("Admin API: Impersonation request failed: #{error_msg}")
+            log_impersonation_failure('create_session', username, error_data['code'] || 'UNKNOWN', error_msg)
+            return nil
+          end
+
+          data = response.json
+          unless data && data['status'] == 'success'
+            Rails.logger.error("Admin API: Impersonation response missing success status")
+            return nil
+          end
+
+          # Log successful impersonation
+          log_impersonation_success('create_session', username, data['id'])
+
+          # Return a session-like object with the response data
+          ImpersonatedSession.new(data)
+        end
+
+        # Log impersonation attempt for audit
+        def log_impersonation_attempt(action, target_user)
+          Rails.logger.info({
+            event: 'admin_api_impersonation_attempt',
+            action: action,
+            admin_user: get_current_pun_user,
+            target_user: target_user,
+            timestamp: Time.now.utc.iso8601,
+            remote_ip: request.remote_ip
+          }.to_json)
+        end
+
+        # Log successful impersonation for audit
+        def log_impersonation_success(action, target_user, session_id)
+          Rails.logger.info({
+            event: 'admin_api_impersonation_success',
+            action: action,
+            admin_user: get_current_pun_user,
+            target_user: target_user,
+            session_id: session_id,
+            timestamp: Time.now.utc.iso8601,
+            remote_ip: request.remote_ip
+          }.to_json)
+        end
+
+        # Log failed impersonation for audit
+        def log_impersonation_failure(action, target_user, error_code, error_message)
+          Rails.logger.warn({
+            event: 'admin_api_impersonation_failure',
+            action: action,
+            admin_user: get_current_pun_user,
+            target_user: target_user,
+            error_code: error_code,
+            error_message: error_message,
+            timestamp: Time.now.utc.iso8601,
+            remote_ip: request.remote_ip
+          }.to_json)
+        end
+
+        # Legacy session creation - creates in admin's dataroot with target_user metadata
+        def create_session_locally(username, app, context)
           session = ::BatchConnect::Session.new
           save_result = session.save(app: app, context: context)
           
@@ -659,15 +869,28 @@ module Api
           end
 
           # Store target_user in the user_defined_context file
-          # This allows us to filter sessions by target_user when listing
           store_target_user_metadata(session, username)
 
           Rails.logger.info("Admin API: Created session #{session.id} for target user #{username}")
           session
-        rescue StandardError => e
-          Rails.logger.error("Admin API: Error creating session for user #{username}: #{e.message}")
-          Rails.logger.error("Admin API: Backtrace: #{e.backtrace.join("\n")}")
-          nil
+        end
+
+        # Wrapper class for session data returned from impersonation
+        class ImpersonatedSession
+          attr_reader :id, :job_id, :created_at, :user, :session_url
+
+          def initialize(data)
+            @id = data['id'] || data['session_id']
+            @job_id = data['job_id']
+            @created_at = data['created_at']
+            @user = data['user']
+            @session_url = data['session_url']
+          end
+
+          # Compatibility with BatchConnect::Session interface
+          def session_id
+            @id
+          end
         end
 
         # Store target_user in session's user context file
