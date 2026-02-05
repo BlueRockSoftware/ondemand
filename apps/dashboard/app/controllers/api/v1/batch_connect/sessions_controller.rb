@@ -847,7 +847,7 @@ module Api
         # Falls back to OOD_SERVER_NAME env var or 'localhost'.
         def resolve_request_host
           self.request.host_with_port
-        rescue StandardError
+        rescue NoMethodError
           ENV['OOD_SERVER_NAME'] || 'localhost'
         end
 

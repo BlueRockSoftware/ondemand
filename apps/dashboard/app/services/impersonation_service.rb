@@ -57,7 +57,7 @@ class ImpersonationService
     rescue PunManager::UserNotFoundError => e
       Rails.logger.error("ImpersonationService: List failed - #{e.message}")
       []
-    rescue StandardError => e
+    rescue Errno::ECONNREFUSED, Net::OpenTimeout, Net::ReadTimeout, SocketError => e
       Rails.logger.error("ImpersonationService: Error listing sessions: #{e.message}")
       []
     end
@@ -278,7 +278,7 @@ class ImpersonationService
     # Get the current PUN user for audit logging.
     def current_pun_user
       OodSupport::User.new.name
-    rescue StandardError
+    rescue NameError, ArgumentError, Errno::ENOENT
       ENV['USER'] || 'unknown'
     end
   end
