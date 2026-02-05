@@ -373,8 +373,22 @@ module Api
         # DELETE /api/v1/batch_connect/sessions/:id
         # Delete a session (for any user)
         # Sends webhook to Volume API if volume_session_id was set (FR-3)
+        #
+        # Optional query parameter:
+        #   - user: Username who owns the session. If provided and impersonation is enabled,
+        #           the request is forwarded to the target user's PUN to delete the session.
         def destroy
-          session_info = find_session_by_id(params[:id])
+          target_user = params[:user]
+          session_id = params[:id]
+
+          # If user parameter is provided, use impersonation to delete from user's PUN
+          if target_user.present? && PunManager.impersonation_enabled? && PunManager.internal_api_token.present?
+            Rails.logger.info("Admin API: Deleting session #{session_id} via impersonation (user: #{target_user})")
+            return destroy_via_impersonation(session_id, target_user)
+          end
+
+          # Fallback: try to find session in accessible directories
+          session_info = find_session_by_id(session_id)
 
           unless session_info
             return render json: {
@@ -392,7 +406,7 @@ module Api
             send_session_ended_webhook(session, 'cancelled', 'User terminated session via API')
 
             session.destroy
-            Rails.logger.info("Admin API: Deleted session #{params[:id]} for user #{user}")
+            Rails.logger.info("Admin API: Deleted session #{session_id} for user #{user}")
 
             render json: {
               status: 'success',
@@ -1026,6 +1040,96 @@ module Api
             session_status: result.dig('session', 'status'),
             connection: result['connection'],
             connection_url: result['connection_url']
+          }
+        end
+
+        # Delete session via Apache-mediated PUN forwarding (impersonation)
+        #
+        # This forwards a DELETE request to the target user's PUN so the session
+        # is deleted in the correct user context with proper file permissions.
+        def destroy_via_impersonation(session_id, target_user)
+          begin
+            # Validate user exists
+            PunManager.validate_user(target_user)
+
+            # Forward DELETE request through Apache
+            response = forward_delete_request_via_apache(target_user, session_id)
+
+            # Parse and return the response
+            handle_delete_impersonation_response(response, session_id, target_user)
+
+          rescue PunManager::UserNotFoundError => e
+            Rails.logger.error("Admin API: Impersonation failed for delete - #{e.message}")
+            render json: {
+              status: 'error',
+              message: e.message
+            }, status: :not_found
+          rescue StandardError => e
+            Rails.logger.error("Admin API: Error in delete impersonation: #{e.class} - #{e.message}")
+            render json: {
+              status: 'error',
+              message: e.message
+            }, status: :internal_server_error
+          end
+        end
+
+        # Forward DELETE request through Apache to target user's PUN
+        def forward_delete_request_via_apache(target_user, session_id)
+          uri = URI("http://127.0.0.1/pun/sys/dashboard/internal/batch_connect/sessions/#{session_id}")
+
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.open_timeout = 10
+          http.read_timeout = 30
+
+          request = Net::HTTP::Delete.new(uri.path)
+          request['Accept'] = 'application/json'
+
+          # Set Host header
+          begin
+            original_host = self.request.host_with_port
+          rescue
+            original_host = ENV['OOD_SERVER_NAME'] || 'localhost'
+          end
+          request['Host'] = original_host
+
+          # Impersonation headers
+          request['X-Impersonate-User'] = target_user
+          request['X-Internal-Token'] = PunManager.internal_api_token
+
+          Rails.logger.debug("Admin API: Forwarding DELETE request via Apache for user #{target_user}, session #{session_id}")
+          response = http.request(request)
+          Rails.logger.debug("Admin API: Apache response: #{response.code} #{response.message}")
+
+          response
+        end
+
+        # Handle response from delete impersonation request
+        def handle_delete_impersonation_response(response, session_id, target_user)
+          unless response.is_a?(Net::HTTPSuccess)
+            error_data = parse_json_response(response.body)
+            error_msg = error_data['message'].presence || "Session not found"
+
+            http_status = case response.code.to_i
+                          when 404 then :not_found
+                          when 422 then :unprocessable_entity
+                          else :bad_gateway
+                          end
+
+            Rails.logger.warn("Admin API: Delete impersonation failed: #{error_msg}")
+            return render json: {
+              status: 'error',
+              message: error_msg
+            }, status: http_status
+          end
+
+          result = parse_json_response(response.body)
+
+          Rails.logger.info("Admin API: Deleted session #{session_id} for user #{target_user} via impersonation")
+
+          render json: {
+            status: 'success',
+            message: 'Session deleted',
+            user: target_user
           }
         end
 
