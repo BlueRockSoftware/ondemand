@@ -169,6 +169,62 @@ module Internal
         }, status: :internal_server_error
       end
 
+      # GET /internal/batch_connect/sessions/:id
+      # Get session details including connection info for the current PUN user
+      #
+      # This endpoint is called by the Admin API during impersonation to get
+      # connection info for a session owned by the PUN user.
+      def show
+        session_id = params[:id]
+        current_user = OodSupport::User.new
+
+        Rails.logger.info("Internal API: Getting session #{session_id} for PUN user #{current_user.name}")
+
+        # Find session in current user's sessions
+        session = ::BatchConnect::Session.all.find { |s| s.id == session_id }
+
+        unless session
+          return render json: {
+            status: 'error',
+            code: 'SESSION_NOT_FOUND',
+            message: "Session not found: #{session_id}"
+          }, status: :not_found
+        end
+
+        session_state = session_status(session)
+        user_context = session.user_context rescue {}
+
+        response_data = {
+          status: 'success',
+          session: {
+            id: session.id,
+            user: current_user.name,
+            job_id: session.job_id,
+            title: session.title,
+            status: session_state,
+            created_at: session.created_at,
+            cluster_id: session.cluster_id,
+            token: session.token,
+            project: user_context['project']
+          }
+        }
+
+        # Include connection info if session is running
+        if session.running?
+          begin
+            connection_info = session.connect.to_h
+            connection_url = build_connection_url(connection_info)
+            response_data[:connection] = connection_info
+            response_data[:connection_url] = connection_url
+          rescue StandardError => e
+            Rails.logger.warn("Internal API: Error getting connection info: #{e.message}")
+          end
+        end
+
+        Rails.logger.info("Internal API: Retrieved session #{session_id} (status: #{session_state})")
+        render json: response_data
+      end
+
       # DELETE /internal/batch_connect/sessions/:id
       # Delete a session in the context of the current PUN user
       def destroy
@@ -256,6 +312,21 @@ module Internal
         'unknown'
       rescue StandardError
         'unknown'
+      end
+
+      # Build connection URL from connection info
+      def build_connection_url(connection_info)
+        host = connection_info[:host] || connection_info['host']
+        port = connection_info[:port] || connection_info['port']
+        password = connection_info[:password] || connection_info['password']
+
+        return nil unless host && port
+
+        # For HTTP-based apps (Jupyter, RStudio), build proxy URL
+        "/node/#{host}/#{port}/"
+      rescue StandardError => e
+        Rails.logger.warn("Internal API: Error building connection URL: #{e.message}")
+        nil
       end
     end
   end

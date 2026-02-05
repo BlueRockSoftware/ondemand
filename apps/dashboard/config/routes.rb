@@ -24,7 +24,7 @@ Rails.application.routes.draw do
   # These endpoints are only accessible from localhost
   namespace :internal do
     namespace :batch_connect do
-      resources :sessions, only: [:index, :create, :destroy]
+      resources :sessions, only: [:index, :show, :create, :destroy]
     end
   end
 
