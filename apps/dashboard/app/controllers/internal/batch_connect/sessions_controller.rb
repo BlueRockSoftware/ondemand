@@ -17,6 +17,17 @@ module Internal
       before_action :verify_internal_access
       before_action :verify_internal_token
 
+      # Ensure all errors return JSON (avoid HTML 500 page so Admin API can parse response)
+      rescue_from StandardError do |e|
+        Rails.logger.error("Internal API: Unhandled error: #{e.class} - #{e.message}")
+        Rails.logger.error(e.backtrace.first(15).join("\n"))
+        render json: {
+          status: 'error',
+          code: 'INTERNAL_ERROR',
+          message: e.message
+        }, status: :internal_server_error
+      end
+
       # GET /internal/batch_connect/sessions
       # List sessions for the current PUN user
       #
@@ -118,11 +129,13 @@ module Internal
         save_result = session.save(app: app, context: context)
 
         unless save_result
-          Rails.logger.error("Internal API: Session save failed for #{current_user.name}")
+          detail = session.errors.full_messages.join('; ')
+          Rails.logger.error("Internal API: Session save failed for #{current_user.name}: #{detail}")
           return render json: {
             status: 'error',
             code: 'SESSION_CREATE_FAILED',
-            message: 'Failed to create session'
+            message: 'Failed to create session',
+            errors: session.errors.full_messages
           }, status: :internal_server_error
         end
 
