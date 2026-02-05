@@ -20,6 +20,8 @@ require 'json'
 require 'ostruct'
 require_relative '../../../../services/volume_webhook_service'
 require_relative '../../../../services/pun_manager'
+require_relative '../../../../services/impersonation_errors'
+require_relative '../../../../services/impersonation_service'
 
 module Api
   module V1
@@ -671,91 +673,10 @@ module Api
         end
 
         # List sessions via Apache-mediated impersonation
+        # Delegates to ImpersonationService for all forwarding logic.
         def list_sessions_via_impersonation(username)
           Rails.logger.info("Admin API: Listing sessions for #{username} via impersonation")
-
-          # Validate user exists
-          PunManager.validate_user(username)
-
-          # Forward request through Apache to target user's PUN
-          response = forward_list_request_via_apache(username)
-
-          # Parse response
-          handle_list_impersonation_response(response, username)
-
-        rescue PunManager::UserNotFoundError => e
-          Rails.logger.error("Admin API: Impersonation failed for list - #{e.message}")
-          []
-        rescue StandardError => e
-          Rails.logger.error("Admin API: Error listing sessions via impersonation: #{e.message}")
-          []
-        end
-
-        # Forward list request through Apache to target user's PUN
-        def forward_list_request_via_apache(target_user)
-          uri = URI('http://127.0.0.1/pun/sys/dashboard/internal/batch_connect/sessions')
-
-          http = Net::HTTP.new(uri.host, uri.port)
-          http.open_timeout = 10
-          http.read_timeout = 30
-
-          request = Net::HTTP::Get.new(uri.path)
-          request['Accept'] = 'application/json'
-
-          # Set Host header to match Apache's ServerName
-          begin
-            original_host = self.request.host_with_port
-          rescue
-            original_host = ENV['OOD_SERVER_NAME'] || 'localhost'
-          end
-          request['Host'] = original_host
-
-          # Impersonation headers
-          request['X-Impersonate-User'] = target_user
-          request['X-Internal-Token'] = PunManager.internal_api_token
-
-          Rails.logger.debug("Admin API: Forwarding list request to Apache for user #{target_user}")
-          http.request(request)
-        end
-
-        # Handle response from list impersonation request
-        def handle_list_impersonation_response(response, username)
-          unless response.is_a?(Net::HTTPSuccess)
-            Rails.logger.error("Admin API: List impersonation failed: #{response.code} #{response.message}")
-            return []
-          end
-
-          data = parse_json_response(response.body)
-          unless data && data['status'] == 'success'
-            Rails.logger.error("Admin API: List impersonation response missing success status")
-            return []
-          end
-
-          # Convert response data to session_info format expected by caller
-          (data['sessions'] || []).map do |session_data|
-            # Create a mock session object that responds to the methods we need
-            session = OpenStruct.new(
-              id: session_data['id'],
-              job_id: session_data['job_id'],
-              title: session_data['title'],
-              created_at: session_data['created_at'],
-              cluster_id: session_data['cluster_id'],
-              token: session_data['token']
-            )
-
-            # Add user_context method that returns project info
-            session.define_singleton_method(:user_context) do
-              { 'project' => session_data['project'] }
-            end
-
-            # Add status-related methods
-            status = session_data['status']
-            session.define_singleton_method(:completed?) { status == 'completed' }
-            session.define_singleton_method(:running?) { status == 'running' }
-            session.define_singleton_method(:queued?) { status == 'queued' }
-
-            { user: username, session: session }
-          end
+          ImpersonationService.list_sessions(username, request_host: resolve_request_host)
         end
 
         # Get target_user from session context (for admin-created sessions)
@@ -862,178 +783,25 @@ module Api
           target_user != current_pun_user
         end
 
-        # Create session via Apache-mediated PUN forwarding (impersonation)
-        #
-        # This method:
-        # 1. Makes an HTTP request back through Apache with impersonation headers
-        # 2. Apache's api_auth.lua validates the internal token and sets REMOTE_USER
-        # 3. Apache's pun_proxy.lua starts the target user's PUN if needed
-        # 4. Request is forwarded to the target user's PUN
-        # 5. Session is created in the target user's context
-        #
-        # Benefits over direct Unix socket approach:
-        # - Uses Apache's existing sudo permissions (www-data)
-        # - Leverages pun_proxy.lua's battle-tested PUN startup logic
-        # - No need for user-level sudo permissions
+        # Create session via Apache-mediated PUN forwarding (impersonation).
+        # Delegates to ImpersonationService for all forwarding logic.
         def create_session_via_impersonation(username, app_token, context)
-          # Log the impersonation attempt
-          log_impersonation_attempt('create_session', username)
-
-          # Validate user exists before attempting impersonation
-          PunManager.validate_user(username)
-
-          # Build request payload for internal API
-          payload = {
-            app_token: app_token,
-            context: context.respond_to?(:to_h) ? context.to_h : context.attributes
-          }
-
-          # Add volume integration parameters if present
-          if context.respond_to?(:attributes)
-            attrs = context.attributes
-            payload[:storage_path] = attrs['storage_path'] if attrs['storage_path'].present?
-            payload[:volume_session_id] = attrs['volume_session_id'] if attrs['volume_session_id'].present?
-          end
-
-          # Forward request through Apache to target user's PUN
-          response = forward_create_request_via_apache(username, payload)
-
-          # Parse response and create session object
-          handle_impersonation_response(response, username)
-
+          ImpersonationService.create_session(
+            username, app_token, context,
+            request_host: resolve_request_host,
+            remote_ip: request.remote_ip
+          )
         rescue PunManager::UserNotFoundError => e
-          Rails.logger.error("Admin API: Impersonation failed - #{e.message}")
-          log_impersonation_failure('create_session', username, 'USER_NOT_FOUND', e.message)
           raise ImpersonationError.new('USER_NOT_FOUND', e.message, :not_found)
         end
 
-        # Forward session creation request through Apache to target user's PUN
-        #
-        # Apache handles:
-        # - Validating the internal token (api_auth.lua)
-        # - Setting REMOTE_USER to target user (api_auth.lua)
-        # - Starting target user's PUN if not running (pun_proxy.lua)
-        # - Routing request to target user's PUN (pun_proxy.lua)
-        def forward_create_request_via_apache(target_user, payload)
-          # Use localhost to reach Apache
-          # Apache listens on port 80 inside the container
-          uri = URI('http://127.0.0.1/pun/sys/dashboard/internal/batch_connect/sessions')
-
-          http = Net::HTTP.new(uri.host, uri.port)
-          http.open_timeout = 10  # Seconds to wait for connection
-          http.read_timeout = 60  # Seconds to wait for response (PUN startup can take time)
-
-          request = Net::HTTP::Post.new(uri.path)
-          request['Content-Type'] = 'application/json'
-          request['Accept'] = 'application/json'
-
-          # Set Host header to match Apache's ServerName to prevent 301 redirects
-          # Use the host from the incoming request so Apache recognizes it
-          begin
-            original_host = self.request.host_with_port
-          rescue
-            original_host = ENV['OOD_SERVER_NAME'] || 'localhost'
-          end
-          request['Host'] = original_host
-
-          # Impersonation headers - api_auth.lua validates these
-          request['X-Impersonate-User'] = target_user
-          request['X-Internal-Token'] = PunManager.internal_api_token
-
-          request.body = payload.to_json
-
-          Rails.logger.debug("Admin API: Forwarding impersonation request to Apache for user #{target_user}")
-          response = http.request(request)
-          Rails.logger.debug("Admin API: Apache response: #{response.code} #{response.message}")
-
-          response
-        end
-
-        # Get session connection info via Apache-mediated PUN forwarding (impersonation)
-        #
-        # This forwards a GET request to the target user's PUN to retrieve session details
-        # including connection information.
+        # Get session connection info via Apache-mediated PUN forwarding (impersonation).
+        # Delegates to ImpersonationService for all forwarding logic.
         def connect_via_impersonation(session_id, target_user)
           Rails.logger.info("Admin API: Getting connection info via impersonation for session #{session_id}, user #{target_user}")
 
-          begin
-            # Validate user exists
-            PunManager.validate_user(target_user)
+          result = ImpersonationService.get_session(session_id, target_user, request_host: resolve_request_host)
 
-            # Forward request through Apache
-            response = forward_get_request_via_apache(target_user, session_id)
-
-            # Parse and return the response
-            handle_connect_impersonation_response(response, session_id, target_user)
-
-          rescue PunManager::UserNotFoundError => e
-            Rails.logger.error("Admin API: Impersonation failed for connect - #{e.message}")
-            render json: {
-              status: 'error',
-              message: e.message
-            }, status: :not_found
-          rescue StandardError => e
-            Rails.logger.error("Admin API: Error in connect impersonation: #{e.class} - #{e.message}")
-            render json: {
-              status: 'error',
-              message: e.message
-            }, status: :internal_server_error
-          end
-        end
-
-        # Forward GET request through Apache to target user's PUN for session info
-        def forward_get_request_via_apache(target_user, session_id)
-          uri = URI("http://127.0.0.1/pun/sys/dashboard/internal/batch_connect/sessions/#{session_id}")
-
-          http = Net::HTTP.new(uri.host, uri.port)
-          http.open_timeout = 10
-          http.read_timeout = 30
-
-          request = Net::HTTP::Get.new(uri.path)
-          request['Accept'] = 'application/json'
-
-          # Set Host header
-          begin
-            original_host = self.request.host_with_port
-          rescue
-            original_host = ENV['OOD_SERVER_NAME'] || 'localhost'
-          end
-          request['Host'] = original_host
-
-          # Impersonation headers
-          request['X-Impersonate-User'] = target_user
-          request['X-Internal-Token'] = PunManager.internal_api_token
-
-          Rails.logger.debug("Admin API: Forwarding GET request via Apache for user #{target_user}, session #{session_id}")
-          response = http.request(request)
-          Rails.logger.debug("Admin API: Apache response: #{response.code} #{response.message}")
-
-          response
-        end
-
-        # Handle response from connect impersonation request
-        def handle_connect_impersonation_response(response, session_id, target_user)
-          unless response.is_a?(Net::HTTPSuccess)
-            error_data = parse_json_response(response.body)
-            error_msg = error_data['message'].presence || "Session not found"
-
-            http_status = case response.code.to_i
-                          when 404 then :not_found
-                          when 422 then :unprocessable_entity
-                          else :bad_gateway
-                          end
-
-            Rails.logger.warn("Admin API: Connect impersonation failed: #{error_msg}")
-            return render json: {
-              status: 'error',
-              message: error_msg
-            }, status: http_status
-          end
-
-          # Parse successful response
-          result = parse_json_response(response.body)
-
-          # Forward the session info with connection details
           render json: {
             status: 'success',
             user: target_user,
@@ -1041,88 +809,21 @@ module Api
             connection: result['connection'],
             connection_url: result['connection_url']
           }
+
+        rescue PunManager::UserNotFoundError => e
+          Rails.logger.error("Admin API: Impersonation failed for connect - #{e.message}")
+          render json: { status: 'error', message: e.message }, status: :not_found
+        rescue ImpersonationError => e
+          render json: { status: 'error', message: e.message }, status: e.http_status
+        rescue StandardError => e
+          Rails.logger.error("Admin API: Error in connect impersonation: #{e.class} - #{e.message}")
+          render json: { status: 'error', message: e.message }, status: :internal_server_error
         end
 
-        # Delete session via Apache-mediated PUN forwarding (impersonation)
-        #
-        # This forwards a DELETE request to the target user's PUN so the session
-        # is deleted in the correct user context with proper file permissions.
+        # Delete session via Apache-mediated PUN forwarding (impersonation).
+        # Delegates to ImpersonationService for all forwarding logic.
         def destroy_via_impersonation(session_id, target_user)
-          begin
-            # Validate user exists
-            PunManager.validate_user(target_user)
-
-            # Forward DELETE request through Apache
-            response = forward_delete_request_via_apache(target_user, session_id)
-
-            # Parse and return the response
-            handle_delete_impersonation_response(response, session_id, target_user)
-
-          rescue PunManager::UserNotFoundError => e
-            Rails.logger.error("Admin API: Impersonation failed for delete - #{e.message}")
-            render json: {
-              status: 'error',
-              message: e.message
-            }, status: :not_found
-          rescue StandardError => e
-            Rails.logger.error("Admin API: Error in delete impersonation: #{e.class} - #{e.message}")
-            render json: {
-              status: 'error',
-              message: e.message
-            }, status: :internal_server_error
-          end
-        end
-
-        # Forward DELETE request through Apache to target user's PUN
-        def forward_delete_request_via_apache(target_user, session_id)
-          uri = URI("http://127.0.0.1/pun/sys/dashboard/internal/batch_connect/sessions/#{session_id}")
-
-          http = Net::HTTP.new(uri.host, uri.port)
-          http.open_timeout = 10
-          http.read_timeout = 30
-
-          request = Net::HTTP::Delete.new(uri.path)
-          request['Accept'] = 'application/json'
-
-          # Set Host header
-          begin
-            original_host = self.request.host_with_port
-          rescue
-            original_host = ENV['OOD_SERVER_NAME'] || 'localhost'
-          end
-          request['Host'] = original_host
-
-          # Impersonation headers
-          request['X-Impersonate-User'] = target_user
-          request['X-Internal-Token'] = PunManager.internal_api_token
-
-          Rails.logger.debug("Admin API: Forwarding DELETE request via Apache for user #{target_user}, session #{session_id}")
-          response = http.request(request)
-          Rails.logger.debug("Admin API: Apache response: #{response.code} #{response.message}")
-
-          response
-        end
-
-        # Handle response from delete impersonation request
-        def handle_delete_impersonation_response(response, session_id, target_user)
-          unless response.is_a?(Net::HTTPSuccess)
-            error_data = parse_json_response(response.body)
-            error_msg = error_data['message'].presence || "Session not found"
-
-            http_status = case response.code.to_i
-                          when 404 then :not_found
-                          when 422 then :unprocessable_entity
-                          else :bad_gateway
-                          end
-
-            Rails.logger.warn("Admin API: Delete impersonation failed: #{error_msg}")
-            return render json: {
-              status: 'error',
-              message: error_msg
-            }, status: http_status
-          end
-
-          result = parse_json_response(response.body)
+          ImpersonationService.delete_session(session_id, target_user, request_host: resolve_request_host)
 
           Rails.logger.info("Admin API: Deleted session #{session_id} for user #{target_user} via impersonation")
 
@@ -1131,104 +832,28 @@ module Api
             message: 'Session deleted',
             user: target_user
           }
+
+        rescue PunManager::UserNotFoundError => e
+          Rails.logger.error("Admin API: Impersonation failed for delete - #{e.message}")
+          render json: { status: 'error', message: e.message }, status: :not_found
+        rescue ImpersonationError => e
+          render json: { status: 'error', message: e.message }, status: e.http_status
+        rescue StandardError => e
+          Rails.logger.error("Admin API: Error in delete impersonation: #{e.class} - #{e.message}")
+          render json: { status: 'error', message: e.message }, status: :internal_server_error
         end
 
-        # Handle response from impersonation request (Net::HTTP response)
-        def handle_impersonation_response(response, username)
-          # Check HTTP status
-          unless response.is_a?(Net::HTTPSuccess)
-            error_data = parse_json_response(response.body)
-            error_msg = error_data['message'].presence || "Internal API returned #{response.code}"
-            if error_data['errors'].present? && error_data['errors'].is_a?(Array)
-              error_msg = "#{error_msg}: #{error_data['errors'].join('; ')}"
-            end
-            # If we still have no detail (e.g. body was not JSON), append truncated body for debugging
-            if error_msg == "Internal API returned #{response.code}" && response.body.present?
-              snippet = response.body.to_s[0, 500].gsub(/\s+/, ' ')
-              error_msg = "#{error_msg} (#{snippet})"
-            end
-            error_code = error_data['code'].presence || 'IMPERSONATION_FAILED'
-
-            Rails.logger.error("Admin API: Impersonation request failed: #{error_msg}")
-            log_impersonation_failure('create_session', username, error_code, error_msg)
-
-            # Map HTTP status to appropriate error
-            http_status = case response.code.to_i
-                          when 401 then :unauthorized
-                          when 404 then :not_found
-                          when 503 then :service_unavailable
-                          when 504 then :gateway_timeout
-                          else :bad_gateway
-                          end
-
-            raise ImpersonationError.new(error_code, error_msg, http_status)
-          end
-
-          data = parse_json_response(response.body)
-          unless data && data['status'] == 'success'
-            error_msg = data&.dig('message') || 'Impersonation response missing success status'
-            if data&.dig('errors').present? && data['errors'].is_a?(Array)
-              error_msg = "#{error_msg}: #{data['errors'].join('; ')}"
-            end
-            Rails.logger.error("Admin API: #{error_msg}")
-            log_impersonation_failure('create_session', username, 'INVALID_RESPONSE', error_msg)
-            raise ImpersonationError.new('INVALID_RESPONSE', error_msg, :bad_gateway)
-          end
-
-          # Log successful impersonation
-          log_impersonation_success('create_session', username, data['id'])
-
-          # Return a session-like object with the response data
-          ImpersonatedSession.new(data)
+        # Resolve the Host header value for forwarding requests through Apache.
+        # Falls back to OOD_SERVER_NAME env var or 'localhost'.
+        def resolve_request_host
+          self.request.host_with_port
+        rescue StandardError
+          ENV['OOD_SERVER_NAME'] || 'localhost'
         end
 
-        # Parse JSON response body safely
-        def parse_json_response(body)
-          return {} if body.nil? || body.empty?
-          JSON.parse(body)
-        rescue JSON::ParserError => e
-          Rails.logger.warn("Admin API: Failed to parse JSON response: #{e.message}")
-          {}
-        end
-
-        # Log impersonation attempt for audit
-        def log_impersonation_attempt(action, target_user)
-          Rails.logger.info({
-            event: 'admin_api_impersonation_attempt',
-            action: action,
-            admin_user: get_current_pun_user,
-            target_user: target_user,
-            timestamp: Time.now.utc.iso8601,
-            remote_ip: request.remote_ip
-          }.to_json)
-        end
-
-        # Log successful impersonation for audit
-        def log_impersonation_success(action, target_user, session_id)
-          Rails.logger.info({
-            event: 'admin_api_impersonation_success',
-            action: action,
-            admin_user: get_current_pun_user,
-            target_user: target_user,
-            session_id: session_id,
-            timestamp: Time.now.utc.iso8601,
-            remote_ip: request.remote_ip
-          }.to_json)
-        end
-
-        # Log failed impersonation for audit
-        def log_impersonation_failure(action, target_user, error_code, error_message)
-          Rails.logger.warn({
-            event: 'admin_api_impersonation_failure',
-            action: action,
-            admin_user: get_current_pun_user,
-            target_user: target_user,
-            error_code: error_code,
-            error_message: error_message,
-            timestamp: Time.now.utc.iso8601,
-            remote_ip: request.remote_ip
-          }.to_json)
-        end
+        # NOTE: forward_*_via_apache, handle_*_impersonation_response,
+        # parse_json_response, and log_impersonation_* methods have been
+        # extracted to ImpersonationService (app/services/impersonation_service.rb)
 
         # Legacy session creation - creates in admin's dataroot with target_user metadata
         def create_session_locally(username, app, context)
@@ -1251,34 +876,8 @@ module Api
         # Error class when session creation fails (stage/submit/local error)
         class SessionCreateError < StandardError; end
 
-        # Error class for impersonation failures
-        class ImpersonationError < StandardError
-          attr_reader :code, :http_status
-
-          def initialize(code, message, http_status = :bad_gateway)
-            @code = code
-            @http_status = http_status
-            super(message)
-          end
-        end
-
-        # Wrapper class for session data returned from impersonation
-        class ImpersonatedSession
-          attr_reader :id, :job_id, :created_at, :user, :session_url
-
-          def initialize(data)
-            @id = data['id'] || data['session_id']
-            @job_id = data['job_id']
-            @created_at = data['created_at']
-            @user = data['user']
-            @session_url = data['session_url']
-          end
-
-          # Compatibility with BatchConnect::Session interface
-          def session_id
-            @id
-          end
-        end
+        # ImpersonationError and ImpersonatedSession are defined in
+        # app/services/impersonation_errors.rb (loaded via require_relative above)
 
         # Store target_user in session's user context file
         def store_target_user_metadata(session, target_user)
