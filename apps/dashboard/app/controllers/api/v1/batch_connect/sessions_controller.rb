@@ -143,6 +143,11 @@ module Api
           # Create context and session using app's build_session_context
           # This properly sets up attribute accessors for the app's form fields
           context = app.build_session_context
+
+          # Ensure cluster is set when app has a single cluster (API clients often omit it)
+          if context_params['cluster'].blank? && app.clusters.size == 1
+            context_params = context_params.merge('cluster' => app.clusters.first.id.to_s)
+          end
           context.attributes = context_params
 
           # Pass volume integration parameters to context for template use
@@ -191,6 +196,13 @@ module Api
               message: 'Failed to create session'
             }, status: :unprocessable_entity
           end
+
+        rescue SessionCreateError => e
+          render json: {
+            status: 'error',
+            code: 'SESSION_CREATE_FAILED',
+            message: e.message
+          }, status: :unprocessable_entity
 
         rescue ActionController::ParameterMissing => e
           render json: {
@@ -800,7 +812,7 @@ module Api
         rescue StandardError => e
           Rails.logger.error("Admin API: Error creating session for user #{username}: #{e.message}")
           Rails.logger.error("Admin API: Backtrace: #{e.backtrace.join("\n")}")
-          nil
+          raise SessionCreateError, e.message
         end
 
         # Get the current PUN user (the user whose PUN is handling this request)
@@ -914,8 +926,16 @@ module Api
           # Check HTTP status
           unless response.is_a?(Net::HTTPSuccess)
             error_data = parse_json_response(response.body)
-            error_msg = error_data['message'] || "Internal API returned #{response.code}"
-            error_code = error_data['code'] || 'IMPERSONATION_FAILED'
+            error_msg = error_data['message'].presence || "Internal API returned #{response.code}"
+            if error_data['errors'].present? && error_data['errors'].is_a?(Array)
+              error_msg = "#{error_msg}: #{error_data['errors'].join('; ')}"
+            end
+            # If we still have no detail (e.g. body was not JSON), append truncated body for debugging
+            if error_msg == "Internal API returned #{response.code}" && response.body.present?
+              snippet = response.body.to_s[0, 500].gsub(/\s+/, ' ')
+              error_msg = "#{error_msg} (#{snippet})"
+            end
+            error_code = error_data['code'].presence || 'IMPERSONATION_FAILED'
 
             Rails.logger.error("Admin API: Impersonation request failed: #{error_msg}")
             log_impersonation_failure('create_session', username, error_code, error_msg)
@@ -935,6 +955,9 @@ module Api
           data = parse_json_response(response.body)
           unless data && data['status'] == 'success'
             error_msg = data&.dig('message') || 'Impersonation response missing success status'
+            if data&.dig('errors').present? && data['errors'].is_a?(Array)
+              error_msg = "#{error_msg}: #{data['errors'].join('; ')}"
+            end
             Rails.logger.error("Admin API: #{error_msg}")
             log_impersonation_failure('create_session', username, 'INVALID_RESPONSE', error_msg)
             raise ImpersonationError.new('INVALID_RESPONSE', error_msg, :bad_gateway)
@@ -1001,8 +1024,9 @@ module Api
           save_result = session.save(app: app, context: context)
           
           unless save_result
-            Rails.logger.error("Admin API: Session save failed for user #{username}")
-            return nil
+            detail = session.errors.full_messages.join('; ')
+            Rails.logger.error("Admin API: Session save failed for user #{username}: #{detail}")
+            raise SessionCreateError, detail.presence || 'Session save failed'
           end
 
           # Store target_user in the user_defined_context file
@@ -1011,6 +1035,9 @@ module Api
           Rails.logger.info("Admin API: Created session #{session.id} for target user #{username}")
           session
         end
+
+        # Error class when session creation fails (stage/submit/local error)
+        class SessionCreateError < StandardError; end
 
         # Error class for impersonation failures
         class ImpersonationError < StandardError
