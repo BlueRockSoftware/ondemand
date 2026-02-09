@@ -42,10 +42,14 @@ http {
   passenger_show_version_in_header off;
 
   # Kill all apps after they idle timeout
+  <%- unless passenger_options.to_h.has_key?(:passenger_min_instances) || passenger_options.to_h.has_key?('passenger_min_instances') -%>
   passenger_min_instances 0;
+  <%- end -%>
 
   # Limit app instances to 1 so apps can safely utilize in memory session data
+  <%- unless passenger_options.to_h.has_key?(:passenger_max_instances_per_app) || passenger_options.to_h.has_key?('passenger_max_instances_per_app') -%>
   passenger_max_instances_per_app 1;
+  <%- end -%>
 
   # Take advantage of Ruby preloader
   #passenger_spawn_method smart;
@@ -54,7 +58,7 @@ http {
   # Load all apps directly
   passenger_spawn_method direct;
 
-  <%- if passenger_pool_idle_time -%>
+  <%- if passenger_pool_idle_time && !passenger_options.to_h.has_key?(:passenger_pool_idle_time) && !passenger_options.to_h.has_key?('passenger_pool_idle_time') -%>
   passenger_pool_idle_time <%= passenger_pool_idle_time %>;
 
   <%- end -%>
