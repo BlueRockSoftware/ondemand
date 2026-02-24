@@ -6,7 +6,7 @@ gem 'rails', '7.0.8.5'
 # Use sqlite3 as the database for Active Record
 # Note that the version has been fixed due to an incompatibilty
 # https://github.com/rails/rails/issues/35153
-gem 'sqlite3', '1.4.2'
+gem 'sqlite3', '1.6.9'
 # Use SCSS for stylesheets
 gem 'sass-rails', '~> 5.0'
 # Use Uglifier as compressor for JavaScript assets
