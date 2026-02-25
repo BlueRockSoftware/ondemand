@@ -586,6 +586,44 @@ module Api
         private
 
         def extract_containers(app_token)
+          containers_data = load_containers_yml(app_token)
+          return extract_containers_from_yml(containers_data) if containers_data
+
+          extract_containers_from_form(app_token)
+        rescue => e
+          Rails.logger.warn("Admin API: Could not extract containers for #{app_token}: #{e.message}")
+          []
+        end
+
+        def load_containers_yml(app_token)
+          app_name = app_token.split('/').last
+          yml_path = File.join('/var/www/ood/apps/sys', app_name, 'containers.yml')
+          return nil unless File.exist?(yml_path)
+
+          YAML.safe_load(File.read(yml_path))
+        rescue => e
+          Rails.logger.warn("Admin API: Could not load containers.yml for #{app_token}: #{e.message}")
+          nil
+        end
+
+        def extract_containers_from_yml(data)
+          results = []
+          (data['containers'] || []).each do |c|
+            (c['versions'] || []).each do |v|
+              results << {
+                value: "#{c['name']}:#{v['tag']}",
+                label: c['label'].to_s,
+                description: (c['description'] || "").to_s,
+                version: v['tag'].to_s,
+                digest: (v['digest'] || "").to_s,
+                current: v['current'] == true
+              }
+            end
+          end
+          results
+        end
+
+        def extract_containers_from_form(app_token)
           bc_app = ::BatchConnect::App.from_token(app_token)
           return [] unless bc_app && bc_app.valid?
 
@@ -595,7 +633,7 @@ module Api
           options = container_attr.opts[:options] || container_attr.opts['options'] || []
           return [] if options.empty?
 
-          descriptions = load_container_descriptions(app_token)
+          descriptions = load_form_descriptions(app_token)
           options.map do |opt|
             if opt.is_a?(Array)
               val = opt[1].to_s
@@ -605,12 +643,9 @@ module Api
               { value: val, label: val, description: (descriptions[val] || "").to_s }
             end
           end
-        rescue => e
-          Rails.logger.warn("Admin API: Could not extract containers for #{app_token}: #{e.message}")
-          []
         end
 
-        def load_container_descriptions(app_token)
+        def load_form_descriptions(app_token)
           app_name = app_token.split('/').last
           form_path = File.join('/var/www/ood/apps/sys', app_name, 'form.yml')
           return {} unless File.exist?(form_path)
@@ -619,7 +654,7 @@ module Api
           container_config = form_data.dig('attributes', 'container') || {}
           container_config['container_descriptions'] || {}
         rescue => e
-          Rails.logger.warn("Admin API: Could not load container descriptions from #{form_path}: #{e.message}")
+          Rails.logger.warn("Admin API: Could not load descriptions from #{form_path}: #{e.message}")
           {}
         end
 
