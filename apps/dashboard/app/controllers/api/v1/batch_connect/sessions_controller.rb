@@ -442,7 +442,9 @@ module Api
               description: (app.manifest.description rescue ""),
               icon_uri: (app.icon_uri rescue "")
             }
-            
+
+            app_data[:containers] = extract_containers(app.token)
+
             if include_details
               begin
                 bc_app = ::BatchConnect::App.from_token(app.token)
@@ -582,6 +584,26 @@ module Api
         end
 
         private
+
+        def extract_containers(app_token)
+          bc_app = ::BatchConnect::App.from_token(app_token)
+          return [] unless bc_app && bc_app.valid?
+
+          container_attr = bc_app.attributes.find { |a| a.id.to_s == 'container' }
+          return [] unless container_attr && container_attr.opts[:options]
+
+          descriptions = container_attr.opts[:container_descriptions] || {}
+          container_attr.opts[:options].map do |opt|
+            if opt.is_a?(Array)
+              { value: opt[1].to_s, label: opt[0].to_s, description: (descriptions[opt[1].to_s] || "").to_s }
+            else
+              { value: opt.to_s, label: opt.to_s, description: (descriptions[opt.to_s] || "").to_s }
+            end
+          end
+        rescue => e
+          Rails.logger.warn("Admin API: Could not extract containers for #{app_token}: #{e.message}")
+          []
+        end
 
         # Authenticate admin API request
         def authenticate_admin_api_request
