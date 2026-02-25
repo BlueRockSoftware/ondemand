@@ -590,19 +590,37 @@ module Api
           return [] unless bc_app && bc_app.valid?
 
           container_attr = bc_app.attributes.find { |a| a.id.to_s == 'container' }
-          return [] unless container_attr && container_attr.opts[:options]
+          return [] unless container_attr
 
-          descriptions = container_attr.opts[:container_descriptions] || {}
-          container_attr.opts[:options].map do |opt|
+          options = container_attr.opts[:options] || container_attr.opts['options'] || []
+          return [] if options.empty?
+
+          descriptions = load_container_descriptions(app_token)
+          options.map do |opt|
             if opt.is_a?(Array)
-              { value: opt[1].to_s, label: opt[0].to_s, description: (descriptions[opt[1].to_s] || "").to_s }
+              val = opt[1].to_s
+              { value: val, label: opt[0].to_s, description: (descriptions[val] || "").to_s }
             else
-              { value: opt.to_s, label: opt.to_s, description: (descriptions[opt.to_s] || "").to_s }
+              val = opt.to_s
+              { value: val, label: val, description: (descriptions[val] || "").to_s }
             end
           end
         rescue => e
           Rails.logger.warn("Admin API: Could not extract containers for #{app_token}: #{e.message}")
           []
+        end
+
+        def load_container_descriptions(app_token)
+          app_name = app_token.split('/').last
+          form_path = File.join('/var/www/ood/apps/sys', app_name, 'form.yml')
+          return {} unless File.exist?(form_path)
+
+          form_data = YAML.safe_load(File.read(form_path), permitted_classes: [Symbol])
+          container_config = form_data.dig('attributes', 'container') || {}
+          container_config['container_descriptions'] || {}
+        rescue => e
+          Rails.logger.warn("Admin API: Could not load container descriptions from #{form_path}: #{e.message}")
+          {}
         end
 
         # Authenticate admin API request
