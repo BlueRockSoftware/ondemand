@@ -607,20 +607,20 @@ module Api
         end
 
         def extract_containers_from_yml(data)
-          results = []
-          (data['containers'] || []).each do |c|
-            (c['versions'] || []).each do |v|
-              results << {
-                value: "#{c['name']}:#{v['tag']}",
-                label: c['label'].to_s,
-                description: (c['description'] || "").to_s,
-                version: v['tag'].to_s,
-                digest: (v['digest'] || "").to_s,
-                current: v['current'] == true
-              }
-            end
+          (data['containers'] || []).map do |c|
+            {
+              name: c['name'].to_s,
+              label: c['label'].to_s,
+              description: (c['description'] || "").to_s,
+              versions: (c['versions'] || []).map do |v|
+                {
+                  tag: v['tag'].to_s,
+                  digest: (v['digest'] || "").to_s,
+                  current: v['current'] == true
+                }
+              end
+            }
           end
-          results
         end
 
         def extract_containers_from_form(app_token)
@@ -637,10 +637,10 @@ module Api
           options.map do |opt|
             if opt.is_a?(Array)
               val = opt[1].to_s
-              { value: val, label: opt[0].to_s, description: (descriptions[val] || "").to_s }
+              { name: val, label: opt[0].to_s, description: (descriptions[val] || "").to_s, versions: [] }
             else
               val = opt.to_s
-              { value: val, label: val, description: (descriptions[val] || "").to_s }
+              { name: val, label: val, description: (descriptions[val] || "").to_s, versions: [] }
             end
           end
         end
