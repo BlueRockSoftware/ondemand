@@ -608,16 +608,15 @@ module Api
 
         def extract_containers_from_yml(data)
           (data['containers'] || []).map do |c|
+            image_name = c['image'].to_s
+            versions = RegistryService.versions_for(image_name)
+
             {
               name: c['name'].to_s,
               label: c['label'].to_s,
               description: (c['description'] || "").to_s,
-              versions: (c['versions'] || []).map do |v|
-                {
-                  tag: v['tag'].to_s,
-                  digest: (v['digest'] || "").to_s,
-                  current: v['current'] == true
-                }
+              versions: versions.map do |v|
+                { tag: v[:tag], digest: v[:digest], current: v[:current] }
               end
             }
           end
