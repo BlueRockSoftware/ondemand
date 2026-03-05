@@ -1,0 +1,23 @@
+---
+kind: NetworkPolicy
+apiVersion: networking.k8s.io/v1
+metadata:
+  namespace: $NAMESPACE
+  name: deny-egress-restricted
+spec:
+  podSelector:
+    matchLabels:
+      ood-outbound-restricted: "true"
+  policyTypes:
+  - Egress
+  egress:
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - ipBlock:
+        cidr: $NETWORK_POLICY_ALLOW_CIDR
+    - ipBlock:
+        cidr: 10.96.0.0/12

@@ -20,6 +20,7 @@ export $(grep -Ev "^#" "$HOOK_ENV" | cut -d= -f1)
 
 export PATH=/usr/local/bin:/bin:$PATH
 export NAMESPACE="${NAMESPACE_PREFIX}${ONDEMAND_USERNAME}"
+export NFS_SERVER="${NFS_SERVER:-169.228.60.45}"
 # shellcheck disable=SC2155
 export TIMESTAMP=$(date +%s)
 
@@ -29,6 +30,7 @@ TMPFILE=$(mktemp "/tmp/k8-ondemand-bootstrap-${ONDEMAND_USERNAME}.XXXXXX")
 
 envsubst < "${YAML_DIR}/namespace.yaml" > "$TMPFILE"
 envsubst < "${YAML_DIR}/network-policy.yaml" >> "$TMPFILE"
+envsubst < "${YAML_DIR}/deny-egress-restricted.yaml" >> "$TMPFILE"
 envsubst < "${YAML_DIR}/rolebinding.yaml" >> "$TMPFILE"
 
 if [ "$USE_POD_SECURITY_POLICY" = "true" ] ; then
