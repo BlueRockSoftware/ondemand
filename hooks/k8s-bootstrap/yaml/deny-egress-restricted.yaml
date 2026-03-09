@@ -21,3 +21,13 @@ spec:
         cidr: $NETWORK_POLICY_ALLOW_CIDR
     - ipBlock:
         cidr: 10.96.0.0/12
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: $EGRESS_PROXY_NAMESPACE
+      podSelector:
+        matchLabels:
+          app: egress-proxy
+    ports:
+    - protocol: TCP
+      port: 3128
