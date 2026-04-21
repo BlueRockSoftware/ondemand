@@ -180,8 +180,7 @@ module Internal
 
         Rails.logger.info("Internal API: Getting session #{session_id} for PUN user #{current_user.name}")
 
-        # Find session in current user's sessions
-        session = ::BatchConnect::Session.all.find { |s| s.id == session_id }
+        session = find_owned_session(session_id)
 
         unless session
           return render json: {
@@ -233,8 +232,7 @@ module Internal
 
         Rails.logger.info("Internal API: Deleting session #{session_id} for PUN user #{current_user.name}")
 
-        # Find session in current user's sessions
-        session = ::BatchConnect::Session.all.find { |s| s.id == session_id }
+        session = find_owned_session(session_id)
 
         unless session
           return render json: {
@@ -300,6 +298,16 @@ module Internal
             code: 'INTERNAL_AUTH_FAILED',
             message: 'Invalid internal API token'
           }, status: :forbidden
+        end
+      end
+
+      # Find a session by ID, ensuring its db file lives under this PUN user's
+      # dataroot.  On shared NFS, Session.all can read files owned by other
+      # users; this ownership check prevents cross-user information disclosure.
+      def find_owned_session(session_id)
+        expected_db_root = ::BatchConnect::Session.db_root.to_s
+        ::BatchConnect::Session.all.find do |s|
+          s.id == session_id && s.db_file&.to_s&.start_with?(expected_db_root)
         end
       end
 
