@@ -251,7 +251,30 @@ class ImpersonationService
         )
       end
 
-      parse_json_response(response.body)
+      data = parse_json_response(response.body)
+
+      unless data.is_a?(Hash) && data['status'].present?
+        content_type = response['Content-Type'] || 'unknown'
+        snippet = response.body.to_s[0, 200].gsub(/\s+/, ' ')
+        Rails.logger.error("ImpersonationService: #{context} returned non-JSON or invalid response " \
+                           "(Content-Type: #{content_type}): #{snippet}")
+        raise ImpersonationError.new(
+          'INVALID_RESPONSE',
+          "Target PUN returned non-API response for #{context}",
+          :bad_gateway
+        )
+      end
+
+      unless data['status'] == 'success'
+        error_msg = data['message'].presence || "#{context} failed"
+        raise ImpersonationError.new(
+          data['code'].presence || 'IMPERSONATION_FAILED',
+          error_msg,
+          :bad_gateway
+        )
+      end
+
+      data
     end
 
     # Safely parse JSON response body, returns {} on failure.

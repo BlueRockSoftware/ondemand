@@ -253,9 +253,21 @@ module Api
         # GET /api/v1/batch_connect/sessions/:id
         # Get details about a specific session
         #
-        # Returns session details including which user owns it
+        # Optional query parameter:
+        #   - user: Username who owns the session. If provided and impersonation is enabled,
+        #           the request is forwarded to the target user's PUN to get session details.
         def show
-          session_info = find_session_by_id(params[:id])
+          target_user = params[:user]
+          session_id = params[:id]
+
+          # If user parameter is provided, use impersonation to get details from user's PUN
+          if target_user.present? && PunManager.impersonation_enabled? && PunManager.internal_api_token.present?
+            Rails.logger.info("Admin API: Getting session details for #{session_id} via impersonation (user: #{target_user})")
+            return show_via_impersonation(session_id, target_user)
+          end
+
+          # Fallback: try to find session in accessible directories
+          session_info = find_session_by_id(session_id)
 
           unless session_info
             return render json: {
@@ -891,6 +903,29 @@ module Api
           render json: { status: 'error', message: e.message }, status: e.http_status
         rescue StandardError => e
           Rails.logger.error("Admin API: Error in connect impersonation: #{e.class} - #{e.message}")
+          render json: { status: 'error', message: e.message }, status: :internal_server_error
+        end
+
+        # Get session details via Apache-mediated PUN forwarding (impersonation).
+        # Delegates to ImpersonationService for all forwarding logic.
+        def show_via_impersonation(session_id, target_user)
+          result = ImpersonationService.get_session(session_id, target_user, request_host: resolve_request_host)
+
+          session_data = result['session'] || {}
+          session_data['connect_url'] = result['connection_url']
+
+          render json: {
+            status: 'success',
+            session: session_data
+          }
+
+        rescue PunManager::UserNotFoundError => e
+          Rails.logger.error("Admin API: Impersonation failed for show - #{e.message}")
+          render json: { status: 'error', message: e.message }, status: :not_found
+        rescue ImpersonationError => e
+          render json: { status: 'error', message: e.message }, status: e.http_status
+        rescue StandardError => e
+          Rails.logger.error("Admin API: Error in show impersonation: #{e.class} - #{e.message}")
           render json: { status: 'error', message: e.message }, status: :internal_server_error
         end
 
