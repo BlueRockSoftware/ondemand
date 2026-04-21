@@ -193,19 +193,26 @@ module Internal
         session_state = session_status(session)
         user_context = session.user_context rescue {}
 
+        session_info = session.info.to_h rescue {}
+        vol_session_id = session_info[:volume_session_id] || session_info['volume_session_id']
+
+        session_hash = {
+          id: session.id,
+          user: current_user.name,
+          job_id: session.job_id,
+          title: session.title,
+          status: session_state,
+          created_at: session.created_at,
+          cluster_id: session.cluster_id,
+          token: session.token,
+          info: session_info,
+          project: user_context['project']
+        }
+        session_hash[:volume_session_id] = vol_session_id if vol_session_id.present?
+
         response_data = {
           status: 'success',
-          session: {
-            id: session.id,
-            user: current_user.name,
-            job_id: session.job_id,
-            title: session.title,
-            status: session_state,
-            created_at: session.created_at,
-            cluster_id: session.cluster_id,
-            token: session.token,
-            project: user_context['project']
-          }
+          session: session_hash
         }
 
         # Include connection info if session is running
