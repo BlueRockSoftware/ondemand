@@ -9,7 +9,7 @@ require 'json'
 # network calls. Determines the "current" version as the highest semver tag.
 #
 # Configuration (environment variables):
-#   OOD_REGISTRY_URL       - Registry path (default: 169.228.60.106:5000/deap)
+#   OOD_REGISTRY_URL       - Registry path (default: 172.20.26.108:5000/deap)
 #   OOD_REGISTRY_CACHE_TTL - Cache TTL in seconds (default: 300)
 #
 # Usage:
@@ -18,7 +18,7 @@ require 'json'
 #
 class RegistryService
   HTTP_TIMEOUT = 5
-  DEFAULT_REGISTRY_URL = "169.228.60.106:5000/deap"
+  DEFAULT_REGISTRY_URL = "172.20.26.108:5000/deap"
   DEFAULT_CACHE_TTL = 300
   MANIFEST_ACCEPT = "application/vnd.docker.distribution.manifest.v2+json"
 
@@ -79,7 +79,7 @@ class RegistryService
     end
 
     # Parse registry_url into API base and repository prefix.
-    # "169.228.60.106:5000/deap" => base="http://169.228.60.106:5000", prefix="deap"
+    # "172.20.26.108:5000/deap" => base="http://172.20.26.108:5000", prefix="deap"
     def registry_parts
       url = registry_url
       parts = url.split("/", 2)

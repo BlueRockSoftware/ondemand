@@ -20,7 +20,7 @@ export $(grep -Ev "^#" "$HOOK_ENV" | cut -d= -f1)
 
 export PATH=/usr/local/bin:/bin:$PATH
 export NAMESPACE="${NAMESPACE_PREFIX}${ONDEMAND_USERNAME}"
-export NFS_SERVER="${NFS_SERVER:-169.228.60.45}"
+export NFS_SERVER="${NFS_SERVER:-172.20.26.45}"
 # shellcheck disable=SC2155
 export TIMESTAMP=$(date +%s)
 
