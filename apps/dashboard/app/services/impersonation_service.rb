@@ -5,7 +5,8 @@ require 'uri'
 require 'json'
 require 'ostruct'
 require_relative 'pun_manager'
-require_relative 'impersonation_errors'
+require_relative 'impersonation_error'
+require_relative 'impersonated_session'
 
 # Centralized service for Apache-mediated PUN (Per-User Nginx) impersonation.
 #
