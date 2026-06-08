@@ -21,6 +21,10 @@ export $(grep -Ev "^#" "$HOOK_ENV" | cut -d= -f1)
 export PATH=/usr/local/bin:/bin:$PATH
 export NAMESPACE="${NAMESPACE_PREFIX}${ONDEMAND_USERNAME}"
 export NFS_SERVER="${NFS_SERVER:-172.20.26.45}"
+# Node subnet for the session NetworkPolicy. Defaults to the pod CIDR when a
+# deployment sets no node CIDR, so network-policy.yaml never renders an empty
+# ipBlock cidr (an invalid NetworkPolicy). See network-policy.yaml.
+export NETWORK_POLICY_ALLOW_NODE_CIDR="${NETWORK_POLICY_ALLOW_NODE_CIDR:-$NETWORK_POLICY_ALLOW_CIDR}"
 # shellcheck disable=SC2155
 export TIMESTAMP=$(date +%s)
 
