@@ -20,7 +20,8 @@ require 'json'
 require 'ostruct'
 require_relative '../../../../services/volume_webhook_service'
 require_relative '../../../../services/pun_manager'
-require_relative '../../../../services/impersonation_errors'
+require_relative '../../../../services/impersonation_error'
+require_relative '../../../../services/impersonated_session'
 require_relative '../../../../services/impersonation_service'
 
 module Api
@@ -986,7 +987,8 @@ module Api
         class SessionCreateError < StandardError; end
 
         # ImpersonationError and ImpersonatedSession are defined in
-        # app/services/impersonation_errors.rb (loaded via require_relative above)
+        # app/services/impersonation_error.rb and impersonated_session.rb
+        # (loaded via require_relative above)
 
         # Store target_user in session's user context file
         def store_target_user_metadata(session, target_user)
