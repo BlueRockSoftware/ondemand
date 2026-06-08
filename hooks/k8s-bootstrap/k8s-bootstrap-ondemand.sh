@@ -20,7 +20,7 @@ export $(grep -Ev "^#" "$HOOK_ENV" | cut -d= -f1)
 
 export PATH=/usr/local/bin:/bin:$PATH
 export NAMESPACE="${NAMESPACE_PREFIX}${ONDEMAND_USERNAME}"
-export NFS_SERVER="${NFS_SERVER:-169.228.60.45}"
+export NFS_SERVER="${NFS_SERVER:-172.20.26.45}"
 # shellcheck disable=SC2155
 export TIMESTAMP=$(date +%s)
 
@@ -28,10 +28,12 @@ BASEDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 YAML_DIR="${BASEDIR}/yaml"
 TMPFILE=$(mktemp "/tmp/k8-ondemand-bootstrap-${ONDEMAND_USERNAME}.XXXXXX")
 
-envsubst < "${YAML_DIR}/namespace.yaml" > "$TMPFILE"
-envsubst < "${YAML_DIR}/network-policy.yaml" >> "$TMPFILE"
-envsubst < "${YAML_DIR}/deny-egress-restricted.yaml" >> "$TMPFILE"
-envsubst < "${YAML_DIR}/rolebinding.yaml" >> "$TMPFILE"
+{
+  envsubst < "${YAML_DIR}/namespace.yaml"
+  envsubst < "${YAML_DIR}/network-policy.yaml"
+  envsubst < "${YAML_DIR}/deny-egress-restricted.yaml"
+  envsubst < "${YAML_DIR}/rolebinding.yaml"
+} > "$TMPFILE"
 
 if [ "$USE_POD_SECURITY_POLICY" = "true" ] ; then
   PASSWD=$(getent passwd "$ONDEMAND_USERNAME")
@@ -53,7 +55,7 @@ fi
 kubectl apply -f "$TMPFILE"
 rm -f "$TMPFILE"
 
-if [ "x$IMAGE_PULL_SECRET" != "x" ]; then
+if [ "$IMAGE_PULL_SECRET" != "" ]; then
   kubectl create secret generic "$IMAGE_PULL_SECRET" \
     --from-file=.dockerconfigjson="$REGISTRY_DOCKER_CONFIG_JSON" \
     --type=kubernetes.io/dockerconfigjson -n "$NAMESPACE" \
