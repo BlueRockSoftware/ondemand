@@ -12,3 +12,13 @@ spec:
     - podSelector: {}
     - ipBlock:
         cidr: $NETWORK_POLICY_ALLOW_CIDR
+    # Node subnet. The OOD portal proxies to a session via the session pod's
+    # host-node NodePort; when the pod is delivered locally on its node, the
+    # packet reaches this policy BEFORE the NodePort masquerade, so the pod sees
+    # the proxy's node IP (outside the pod CIDR) as source. Without allowing the
+    # node subnet, Calico default-denies it and the connect fails with 503.
+    # Defaults to $NETWORK_POLICY_ALLOW_CIDR when a cluster sets no NODE_CIDR
+    # (a harmless duplicate ipBlock; e.g. clusters whose POD_CIDR is already the
+    # node subnet).
+    - ipBlock:
+        cidr: $NETWORK_POLICY_ALLOW_NODE_CIDR
