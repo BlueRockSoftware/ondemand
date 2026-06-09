@@ -102,19 +102,32 @@ class UserProvisioner
       raise ProvisionError, "Keycloak lookup failed for '#{preferred_username}'"
     end
 
+    # LDAP/k8s env user_map.py (via ldap_ops.py / create_k8s_account.py) needs.
+    # On the Apache login path these are inherited from the container env; in the
+    # admin PUN the env is scrubbed, so we forward them explicitly into the
+    # mapper's invocation. They are read here from the bare name or its OOD_
+    # alias (the only form that survives the PUN's OOD_*-only passthrough), and
+    # passed as BARE names so sudo's env_keep (LDAP_*/KUBERNETES_*) preserves
+    # them and ldap_ops.py reads them directly.
+    FORWARDED_ENV = %w[
+      LDAP_URI LDAP_BIND_DN LDAP_BIND_PW LDAP_BASE_DN
+      KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT
+    ].freeze
+
     def run_user_map(oidc_sub, preferred_username)
-      stdout, stderr, status = Open3.capture3(
-        { 'OIDC_SUB' => oidc_sub },
-        *USER_MAP_CMD,
-        preferred_username
-      )
+      env = subprocess_env(oidc_sub)
+      stdout, stderr, status = Open3.capture3(env, *USER_MAP_CMD, preferred_username)
       username = stdout.to_s.strip.lines.last&.strip
       unless status.success? && !username.to_s.empty?
+        detail = stderr.to_s.strip.lines.last(3).join(' ').strip
         Rails.logger.error(
           "UserProvisioner: user_map.py failed for #{preferred_username} " \
-          "(exit=#{status.exitstatus}): #{stderr.to_s.strip}"
+          "(exit=#{status.exitstatus}): #{detail}"
         )
-        raise ProvisionError, "Failed to provision user '#{preferred_username}'"
+        # Surface the mapper's own error so the API response is self-diagnosing.
+        msg = "Failed to provision user '#{preferred_username}'"
+        msg += ": #{detail}" unless detail.empty?
+        raise ProvisionError, msg
       end
       username
     rescue ProvisionError
@@ -122,6 +135,22 @@ class UserProvisioner
     rescue StandardError => e
       Rails.logger.error("UserProvisioner: unexpected error provisioning #{preferred_username}: #{e.message}")
       raise ProvisionError, "Failed to provision user '#{preferred_username}'"
+    end
+
+    # OIDC_SUB plus the forwarded LDAP/k8s vars (bare name or OOD_ alias).
+    def subprocess_env(oidc_sub)
+      env = { 'OIDC_SUB' => oidc_sub }
+      FORWARDED_ENV.each do |name|
+        value = ENV[name] || ENV["OOD_#{name}"]
+        env[name] = value unless value.to_s.empty?
+      end
+      if env['LDAP_BIND_PW'].to_s.empty? || env['LDAP_URI'].to_s.empty?
+        raise ProvisionError,
+              'LDAP credentials are not available in the provisioning context ' \
+              '(neither LDAP_* nor OOD_LDAP_* is set on the dashboard PUN). ' \
+              'Check the OOD chart deployment env and pun_custom_env_declarations.'
+      end
+      env
     end
   end
 end
