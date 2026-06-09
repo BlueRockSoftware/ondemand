@@ -20,13 +20,17 @@ module Api
       before_action :authenticate_admin_api_request
 
       # POST /api/v1/users/provision
-      # Body: { "sub": "<keycloak-uuid>", "preferred_username": "user@domain.org" }
+      # Body: { "preferred_username": "user@domain.org", "sub"?: "<keycloak-uuid>" }
+      #   - sub is the RAW upstream (Keycloak) subject. Preferred when the caller
+      #     has it (e.g. the test-app from its Keycloak session).
+      #   - When sub is omitted, it is looked up from Keycloak by email (requires
+      #     KEYCLOAK_ADMIN_* configured on the OOD pod).
       # Returns: { "status": "success", "username": "user_domain" }
       def provision
-        sub = params.require(:sub)
         preferred_username = params.require(:preferred_username)
+        sub = params[:sub]
 
-        username = UserProvisioner.call(sub: sub, preferred_username: preferred_username)
+        username = UserProvisioner.call(preferred_username: preferred_username, sub: sub)
 
         render json: { status: 'success', username: username }, status: :ok
       rescue ActionController::ParameterMissing => e
@@ -34,6 +38,12 @@ module Api
           status: 'error',
           message: "Missing required parameter: #{e.param}"
         }, status: :bad_request
+      rescue UserProvisioner::UserNotFoundError => e
+        render json: {
+          status: 'error',
+          code: 'USER_NOT_FOUND',
+          message: e.message
+        }, status: :not_found
       rescue UserProvisioner::ProvisionError => e
         render json: {
           status: 'error',
