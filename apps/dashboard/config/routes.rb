@@ -17,6 +17,9 @@ Rails.application.routes.draw do
           end
         end
       end
+      # Idempotent resolve-or-create of a local identity for an OIDC user.
+      # Clients call this before session-create / Volume API requests.
+      post 'users/provision', to: 'users#provision'
     end
   end
 
