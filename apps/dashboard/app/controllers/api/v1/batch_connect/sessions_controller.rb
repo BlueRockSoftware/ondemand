@@ -28,6 +28,8 @@ module Api
   module V1
     module BatchConnect
       class SessionsController < ApplicationController
+        include AdminApiAuthentication
+
         # Skip CSRF verification for API calls
         skip_before_action :verify_authenticity_token
 
@@ -668,40 +670,6 @@ module Api
         rescue => e
           Rails.logger.warn("Admin API: Could not load descriptions from #{form_path}: #{e.message}")
           {}
-        end
-
-        # Authenticate admin API request
-        def authenticate_admin_api_request
-          auth_header = request.headers['Authorization']
-
-          unless auth_header&.start_with?('Bearer ')
-            Rails.logger.warn("Admin API: No Authorization header from #{request.remote_ip}")
-            return render json: {
-              status: 'error',
-              message: 'Authentication required. Provide Bearer token.'
-            }, status: :unauthorized
-          end
-
-          token = auth_header.split(' ').last
-
-          unless validate_admin_token(token)
-            Rails.logger.warn("Admin API: Invalid admin token from #{request.remote_ip}")
-            return render json: {
-              status: 'error',
-              message: 'Invalid or unauthorized API token'
-            }, status: :unauthorized
-          end
-
-          Rails.logger.debug("Admin API: Authenticated with admin token")
-          true
-        end
-
-        # Validate admin token
-        # TODO: Implement proper token validation with database storage
-        def validate_admin_token(token)
-          # For now, accept tokens starting with 'ood-api-admin-'
-          # In production: validate against stored admin tokens, check expiration, etc.
-          token.start_with?('ood-api-admin-')
         end
 
         # List all sessions across all users

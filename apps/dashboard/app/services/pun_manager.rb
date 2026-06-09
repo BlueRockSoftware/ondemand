@@ -33,7 +33,16 @@ class PunManager
     def validate_user(username)
       Etc.getpwnam(username)
     rescue ArgumentError
-      raise UserNotFoundError, "User not found: #{username}"
+      # NSS could not resolve the username. The usual cause is that the user
+      # has never been provisioned (no LDAP posixAccount yet) -- e.g. they only
+      # authenticated to a downstream app and never completed an OOD login.
+      # Provision them first via POST /api/v1/users/provision (with their OIDC
+      # sub), or have them log into the OOD dashboard once. A genuinely
+      # unreachable LDAP/nslcd would surface here the same way.
+      raise UserNotFoundError,
+            "User not found: #{username}. The account is not provisioned; " \
+            'call POST /api/v1/users/provision (with the OIDC sub) or have the ' \
+            'user log into OOD once before creating a session.'
     end
 
     # Check if impersonation is enabled
