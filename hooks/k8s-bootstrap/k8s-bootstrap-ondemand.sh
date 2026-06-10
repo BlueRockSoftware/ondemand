@@ -30,6 +30,15 @@ export NETWORK_POLICY_ALLOW_NODE_CIDR="${NETWORK_POLICY_ALLOW_NODE_CIDR:-$NETWOR
 # ingress. Defaults to the pod CIDR when unset, so deny-egress-restricted.yaml
 # never renders an empty ipBlock cidr. See deny-egress-restricted.yaml.
 export NETWORK_POLICY_ALLOW_API_CIDR="${NETWORK_POLICY_ALLOW_API_CIDR:-$NETWORK_POLICY_ALLOW_CIDR}"
+# spec 043: network-policy.yaml scopes session ingress to the OOD portal
+# namespace via $OOD_PORTAL_NAMESPACE (provided by the chart hook.env). If a
+# stale hook.env omits it, fail loudly here rather than envsubst it to an empty
+# string -- an empty namespaceSelector matches NO namespace, which would make
+# every session unreachable through the portal (silent, cluster-wide outage).
+if [ -z "${OOD_PORTAL_NAMESPACE:-}" ]; then
+  echo "level=error msg=\"OOD_PORTAL_NAMESPACE unset; refusing to render the session NetworkPolicy. Update the OOD chart hook.env (spec 043).\""
+  exit 1
+fi
 # shellcheck disable=SC2155
 export TIMESTAMP=$(date +%s)
 

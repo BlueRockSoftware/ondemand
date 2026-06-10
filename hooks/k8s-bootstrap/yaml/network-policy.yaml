@@ -9,16 +9,24 @@ spec:
     matchLabels:
   ingress:
   - from:
+    # Intra-namespace traffic: the session's own init containers and pods.
     - podSelector: {}
-    - ipBlock:
-        cidr: $NETWORK_POLICY_ALLOW_CIDR
-    # Node subnet. The OOD portal proxies to a session via the session pod's
-    # host-node NodePort; when the pod is delivered locally on its node, the
-    # packet reaches this policy BEFORE the NodePort masquerade, so the pod sees
-    # the proxy's node IP (outside the pod CIDR) as source. Without allowing the
-    # node subnet, Calico default-denies it and the connect fails with 503.
-    # Defaults to $NETWORK_POLICY_ALLOW_CIDR when a cluster sets no NODE_CIDR
-    # (a harmless duplicate ipBlock; e.g. clusters whose POD_CIDR is already the
-    # node subnet).
-    - ipBlock:
-        cidr: $NETWORK_POLICY_ALLOW_NODE_CIDR
+    # The OOD portal namespace ONLY (spec 043). This previously admitted the
+    # ENTIRE cluster pod network via the $NETWORK_POLICY_ALLOW_CIDR (POD_CIDR)
+    # ipBlock. Because a NetworkPolicy's `from:` entries are OR'd, that let ANY
+    # pod anywhere in the cluster -- including another user's session -- reach
+    # this session and execute code, since the session app has no auth of its
+    # own. Sessions live in per-user namespaces, never the portal namespace, so
+    # scoping ingress to the portal namespace blocks cross-user reachability
+    # while still allowing the portal proxy (and volume-api/test-app, which share
+    # that namespace) to connect. Selected by the auto-applied
+    # kubernetes.io/metadata.name label (no manual namespace labeling needed),
+    # the same pattern deny-egress-restricted.yaml already uses.
+    #
+    # Requires the session Service to be ClusterIP, not NodePort (see
+    # pod-template-override.yml.erb): in-cluster pod->ClusterIP delivery keeps the
+    # portal pod's source IP so this namespace match holds. The old NODE_CIDR
+    # ipBlock existed only for the removed NodePort/node-IP delivery path.
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: $OOD_PORTAL_NAMESPACE
