@@ -21,6 +21,21 @@ spec:
         cidr: $NETWORK_POLICY_ALLOW_CIDR
     - ipBlock:
         cidr: 10.96.0.0/12
+  # In-cluster Kubernetes API server. The session init container
+  # (get_host_port.py) reads its Service/ConfigMap to discover the connection
+  # host:port; without this a restricted session never starts. The API ClusterIP
+  # (10.96.0.1:443) DNATs to a control-plane node IP on :6443, and Calico
+  # evaluates egress against that post-DNAT node IP -- which the pod/service
+  # CIDRs above don't cover -- so the node subnet must be allowed on :6443.
+  # NETWORK_POLICY_ALLOW_API_CIDR defaults to POD_CIDR when a cluster sets no
+  # API_SERVER_CIDR (a harmless duplicate; restricted sessions on such a cluster
+  # remain broken until it is set, same as before this rule existed).
+  - to:
+    - ipBlock:
+        cidr: $NETWORK_POLICY_ALLOW_API_CIDR
+    ports:
+    - protocol: TCP
+      port: 6443
   - to:
     - namespaceSelector:
         matchLabels:
