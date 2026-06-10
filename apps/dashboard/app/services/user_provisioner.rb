@@ -43,6 +43,10 @@ class UserProvisioner
   class ProvisionError < StandardError; end
   # The email has no matching user in the upstream IdP (so no sub to key on).
   class UserNotFoundError < ProvisionError; end
+  # No sub was supplied and the (optional) Keycloak email->sub lookup is not
+  # configured, so the caller MUST provide the raw sub. A client-input error,
+  # surfaced as 400 (not 422) -- the request is missing required input.
+  class SubRequiredError < ProvisionError; end
 
   class << self
     # Provision by raw sub (preferred) or, when sub is blank, by email lookup.
@@ -94,9 +98,9 @@ class UserProvisioner
 
       sub
     rescue KeycloakAdminClient::NotConfiguredError
-      raise ProvisionError,
-            'No sub supplied and Keycloak admin lookup is not configured; ' \
-            'provide the OIDC sub or configure KEYCLOAK_ADMIN_* on the OOD pod.'
+      raise SubRequiredError,
+            "sub is required: supply the user's raw Keycloak sub. (The email " \
+            'fallback needs the Keycloak admin lookup, which is not configured.)'
     rescue KeycloakAdminClient::Error => e
       Rails.logger.error("UserProvisioner: Keycloak lookup failed for #{preferred_username}: #{e.message}")
       raise ProvisionError, "Keycloak lookup failed for '#{preferred_username}'"

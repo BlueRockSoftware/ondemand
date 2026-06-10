@@ -65,4 +65,12 @@ class Api::V1::UsersControllerTest < ActionDispatch::IntegrationTest
     assert_response :unprocessable_entity
     assert_equal 'PROVISION_FAILED', JSON.parse(response.body)['code']
   end
+
+  test 'returns 400 SUB_REQUIRED when sub omitted and lookup unconfigured' do
+    UserProvisioner.stubs(:call).raises(UserProvisioner::SubRequiredError, 'sub is required')
+
+    post '/api/v1/users/provision', params: { preferred_username: EMAIL }, headers: auth_headers
+    assert_response :bad_request
+    assert_equal 'SUB_REQUIRED', JSON.parse(response.body)['code']
+  end
 end

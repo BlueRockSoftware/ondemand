@@ -98,13 +98,13 @@ class UserProvisionerTest < ActiveSupport::TestCase
     end
   end
 
-  test 'raises ProvisionError when sub omitted and Keycloak lookup unconfigured' do
+  test 'raises SubRequiredError when sub omitted and Keycloak lookup unconfigured' do
     with_ldap_env do
       KeycloakAdminClient.expects(:lookup_sub_by_email).raises(KeycloakAdminClient::NotConfiguredError)
-      error = assert_raises(UserProvisioner::ProvisionError) do
+      error = assert_raises(UserProvisioner::SubRequiredError) do
         UserProvisioner.call(preferred_username: EMAIL)
       end
-      assert_match(/not configured/, error.message)
+      assert_match(/sub is required/, error.message)
     end
   end
 
