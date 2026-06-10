@@ -25,6 +25,11 @@ export NFS_SERVER="${NFS_SERVER:-172.20.26.45}"
 # deployment sets no node CIDR, so network-policy.yaml never renders an empty
 # ipBlock cidr (an invalid NetworkPolicy). See network-policy.yaml.
 export NETWORK_POLICY_ALLOW_NODE_CIDR="${NETWORK_POLICY_ALLOW_NODE_CIDR:-$NETWORK_POLICY_ALLOW_CIDR}"
+# API-server subnet for restricted sessions' egress NetworkPolicy. Independent
+# of NODE_CIDR (which drives ingress) so allowing API egress doesn't loosen
+# ingress. Defaults to the pod CIDR when unset, so deny-egress-restricted.yaml
+# never renders an empty ipBlock cidr. See deny-egress-restricted.yaml.
+export NETWORK_POLICY_ALLOW_API_CIDR="${NETWORK_POLICY_ALLOW_API_CIDR:-$NETWORK_POLICY_ALLOW_CIDR}"
 # shellcheck disable=SC2155
 export TIMESTAMP=$(date +%s)
 
