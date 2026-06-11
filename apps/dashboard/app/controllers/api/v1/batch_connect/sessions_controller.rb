@@ -45,6 +45,16 @@ module Api
         #
         # Query parameters:
         #   - user: (optional) filter sessions by username
+        #   - live: (optional, default true) when listing all users, resolve
+        #           job statuses by forwarding to each owner's PUN. Pass
+        #           "false" to skip the fan-out and return cached statuses.
+        #
+        # Each session entry carries a status_source field:
+        #   - "live":    evaluated in the owner's PUN (authoritative)
+        #   - "cached":  from the session db's completed latch (authoritative,
+        #                terminal)
+        #   - "unknown": owner's PUN unreachable or fan-out skipped; the job
+        #                state cannot be determined from this context
         #
         # Returns:
         # {
@@ -53,13 +63,14 @@ module Api
         # }
         def index
           target_user = params[:user]
+          live = params[:live] != 'false'
 
           if target_user
             Rails.logger.info("Admin API: Listing sessions for user #{target_user}")
             sessions = list_user_sessions(target_user)
           else
-            Rails.logger.info("Admin API: Listing all sessions")
-            sessions = list_all_sessions
+            Rails.logger.info("Admin API: Listing all sessions (live: #{live})")
+            sessions = list_all_sessions(live: live)
           end
 
           sessions_data = sessions.map do |session_info|
@@ -72,7 +83,10 @@ module Api
               user: effective_user,
               job_id: session.job_id,
               title: session.title,
-              status: session_status(session),
+              # Entries that could not be evaluated in the owner's PUN carry an
+              # explicit status; everything else is evaluated live here.
+              status: session_info[:status] || session_status(session),
+              status_source: session_info[:status_source] || 'live',
               created_at: session.created_at,
               cluster_id: session.cluster_id,
               token: session.token,
@@ -704,13 +718,17 @@ module Api
 
         # List all sessions across all users
         # This requires accessing the base dataroot and iterating through user directories
-        def list_all_sessions
+        def list_all_sessions(live: true)
           sessions = []
           base_dataroot = get_base_dataroot
 
           return sessions unless base_dataroot.exist?
 
-          # Iterate through potential user directories
+          # Iterate through potential user directories. Sessions are grouped by
+          # DIRECTORY OWNER (not target_user metadata): the owner's PUN is the
+          # only context that can evaluate a session's job state, and legacy
+          # admin-created sessions live in the admin's dataroot with pods in
+          # the admin's namespace, so they must be evaluated locally.
           base_dataroot.children.select(&:directory?).each do |user_dir|
             # Each user directory contains batch_connect data
             user_batch_connect_dir = user_dir.join('ondemand', 'data', 'sys', 'dashboard', 'batch_connect')
@@ -721,10 +739,65 @@ module Api
             next unless username
 
             user_sessions = load_user_sessions_from_dataroot(user_batch_connect_dir, username)
-            sessions.concat(user_sessions)
+            next if user_sessions.empty?
+
+            sessions.concat(resolve_owner_session_entries(username, user_sessions, live: live))
           end
 
           sessions
+        end
+
+        # Decide how to report one owner's sessions in the unfiltered listing.
+        # Only the owner's PUN can evaluate live job state (the k8s adapter
+        # namespaces kubectl by the calling PUN user), so cross-user statuses
+        # come from impersonation or from the session db's completed latch —
+        # never from evaluating another user's session in this PUN.
+        def resolve_owner_session_entries(owner, session_infos, live: true)
+          # Our own sessions: this PUN is the correct evaluation context.
+          return session_infos if owner == get_current_pun_user
+
+          # All sessions latched completed: the latch is terminal and reading
+          # it never touches the job adapter, so no PUN wake-up is needed.
+          if session_infos.all? { |info| info[:session].cache_completed }
+            return session_infos.map { |info| degraded_session_entry(info) }
+          end
+
+          if live && should_impersonate_for_list?(owner)
+            live_entries = list_sessions_via_impersonation(owner)
+            return merge_live_owner_entries(session_infos, live_entries) unless live_entries.nil?
+
+            Rails.logger.warn("Admin API: Live listing for #{owner} failed; reporting cached statuses")
+          end
+
+          session_infos.map { |info| degraded_session_entry(info) }
+        rescue StandardError => e
+          # One bad owner must never break the whole listing.
+          Rails.logger.error("Admin API: Error resolving sessions for #{owner}: #{e.class} - #{e.message}")
+          session_infos.map { |info| degraded_session_entry(info) }
+        end
+
+        # Combine a successful live listing from the owner's PUN with the
+        # locally scanned db files. Live entries win; local sessions absent
+        # from the live response were reaped by the owner's session cleanup,
+        # so keep them only if their completed latch makes the status certain.
+        def merge_live_owner_entries(session_infos, live_entries)
+          live_ids = live_entries.map { |entry| entry[:session].id }.to_set
+
+          leftovers = session_infos.reject { |info| live_ids.include?(info[:session].id) }
+                                   .select { |info| info[:session].cache_completed }
+                                   .map { |info| degraded_session_entry(info) }
+
+          live_entries + leftovers
+        end
+
+        # Report a session without evaluating it: 'completed' when the db's
+        # completed latch is set (terminal, authoritative), 'unknown' otherwise.
+        def degraded_session_entry(session_info)
+          if session_info[:session].cache_completed
+            session_info.merge(status: 'completed', status_source: 'cached')
+          else
+            session_info.merge(status: 'unknown', status_source: 'unknown')
+          end
         end
 
         # List sessions for a specific user
@@ -734,7 +807,10 @@ module Api
         def list_user_sessions(username)
           # Use impersonation if enabled and target user differs from current PUN user
           if should_impersonate_for_list?(username)
-            return list_sessions_via_impersonation(username)
+            live_entries = list_sessions_via_impersonation(username)
+            return live_entries unless live_entries.nil?
+
+            Rails.logger.warn("Admin API: Live listing for #{username} failed; reporting cached statuses")
           end
 
           # Fallback: direct file read (only works if current user can read target's files)
@@ -746,12 +822,17 @@ module Api
             sessions.concat(load_user_sessions_from_dataroot(batch_connect_dir, username))
           end
 
-          sessions
+          # Another user's sessions cannot be evaluated in this PUN's context
+          # (wrong k8s namespace); report cached statuses instead.
+          return sessions if username == get_current_pun_user
+
+          sessions.map { |info| degraded_session_entry(info) }
         end
 
         # Check if we should use impersonation for listing sessions
         def should_impersonate_for_list?(target_user)
           return false unless PunManager.impersonation_enabled?
+          return false if PunManager.internal_api_token.blank?
 
           current_pun_user = get_current_pun_user
           target_user != current_pun_user
