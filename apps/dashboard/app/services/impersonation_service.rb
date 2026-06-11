@@ -50,6 +50,11 @@ class ImpersonationService
 
     # List sessions in the target user's PUN context.
     # @return [Array<Hash>] Session info hashes [{ user: String, session: OpenStruct }], or [] on failure
+    # Returns an array of session-info hashes on success (possibly empty —
+    # the target PUN legitimately reported no sessions), or nil when the
+    # listing could not be obtained (unknown user, PUN unreachable, token not
+    # configured). Callers must treat nil as "status unknown", not "no
+    # sessions".
     def list_sessions(username, request_host:)
       validate_prerequisites!
       PunManager.validate_user(username)
@@ -57,10 +62,13 @@ class ImpersonationService
       parse_list_response(response, username)
     rescue PunManager::UserNotFoundError => e
       Rails.logger.error("ImpersonationService: List failed - #{e.message}")
-      []
+      nil
+    rescue ImpersonationError => e
+      Rails.logger.error("ImpersonationService: List failed - #{e.message}")
+      nil
     rescue Errno::ECONNREFUSED, Net::OpenTimeout, Net::ReadTimeout, SocketError => e
       Rails.logger.error("ImpersonationService: Error listing sessions: #{e.message}")
-      []
+      nil
     end
 
     # Get session details (including connection info) from the target user's PUN.
@@ -210,17 +218,18 @@ class ImpersonationService
       ImpersonatedSession.new(data)
     end
 
-    # Parse list response: returns array of session-info hashes with OpenStruct sessions.
+    # Parse list response: returns array of session-info hashes with OpenStruct
+    # sessions, or nil when the response is not a successful listing.
     def parse_list_response(response, username)
       unless response.is_a?(Net::HTTPSuccess)
         Rails.logger.error("ImpersonationService: List failed: #{response.code} #{response.message}")
-        return []
+        return nil
       end
 
       data = parse_json_response(response.body)
       unless data && data['status'] == 'success'
         Rails.logger.error("ImpersonationService: List response missing success status")
-        return []
+        return nil
       end
 
       (data['sessions'] || []).map do |sd|
