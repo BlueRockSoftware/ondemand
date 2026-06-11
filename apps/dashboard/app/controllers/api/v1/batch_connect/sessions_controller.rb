@@ -262,22 +262,32 @@ module Api
         def show
           target_user = params[:user]
           session_id = params[:id]
+          current_pun_user = get_current_pun_user
+          session_info = nil
 
-          # If user parameter is provided, use impersonation to get details from user's PUN
-          if target_user.present? && PunManager.impersonation_enabled? && PunManager.internal_api_token.present?
+          # Only the owner's PUN can evaluate a session's job state: the k8s
+          # adapter namespaces kubectl by the calling PUN user, and ood_core
+          # reports a pod it cannot see as "completed". Resolve the owner from
+          # the session db when the caller omits user, and never evaluate
+          # another user's session locally.
+          if target_user.blank?
+            session_info = find_session_by_id(session_id)
+            return render_session_not_found unless session_info
+
+            target_user = session_info[:user]
+            Rails.logger.info("Admin API: Resolved session #{session_id} owner to #{target_user}")
+          end
+
+          if should_impersonate?(target_user, current_pun_user)
             Rails.logger.info("Admin API: Getting session details for #{session_id} via impersonation (user: #{target_user})")
             return show_via_impersonation(session_id, target_user)
           end
 
-          # Fallback: try to find session in accessible directories
-          session_info = find_session_by_id(session_id)
+          return render_impersonation_unavailable(session_id, target_user) unless target_user == current_pun_user
 
-          unless session_info
-            return render json: {
-              status: 'error',
-              message: 'Session not found'
-            }, status: :not_found
-          end
+          # Local path: the current PUN user owns the session
+          session_info ||= find_session_by_id(session_id)
+          return render_session_not_found unless session_info
 
           session = session_info[:session]
           user = session_info[:user]
@@ -328,27 +338,38 @@ module Api
         # Get connection details for a running session
         #
         # Optional query parameter:
-        #   - user: Username who owns the session. If provided and impersonation is enabled,
-        #           the request is forwarded to the target user's PUN to get connection info.
+        #   - user: Username who owns the session. When omitted, the owner is
+        #           resolved from the session database. Cross-user requests are
+        #           forwarded to the owner's PUN via impersonation.
         def connect
           target_user = params[:user]
           session_id = params[:id]
+          current_pun_user = get_current_pun_user
+          session_info = nil
 
-          # If user parameter is provided, use impersonation to get connection info from user's PUN
-          if target_user.present? && PunManager.impersonation_enabled? && PunManager.internal_api_token.present?
+          # Only the owner's PUN can evaluate a session's job state: the k8s
+          # adapter namespaces kubectl by the calling PUN user, and ood_core
+          # reports a pod it cannot see as "completed". Resolve the owner from
+          # the session db when the caller omits user, and never evaluate
+          # another user's session locally.
+          if target_user.blank?
+            session_info = find_session_by_id(session_id)
+            return render_session_not_found unless session_info
+
+            target_user = session_info[:user]
+            Rails.logger.info("Admin API: Resolved session #{session_id} owner to #{target_user}")
+          end
+
+          if should_impersonate?(target_user, current_pun_user)
             Rails.logger.info("Admin API: Getting connection info for session #{session_id} via impersonation (user: #{target_user})")
             return connect_via_impersonation(session_id, target_user)
           end
 
-          # Fallback: try to find session in accessible directories
-          session_info = find_session_by_id(session_id)
+          return render_impersonation_unavailable(session_id, target_user) unless target_user == current_pun_user
 
-          unless session_info
-            return render json: {
-              status: 'error',
-              message: 'Session not found'
-            }, status: :not_found
-          end
+          # Local path: the current PUN user owns the session
+          session_info ||= find_session_by_id(session_id)
+          return render_session_not_found unless session_info
 
           session = session_info[:session]
           user = session_info[:user]
@@ -392,27 +413,36 @@ module Api
         # Sends webhook to Volume API if volume_session_id was set (FR-3)
         #
         # Optional query parameter:
-        #   - user: Username who owns the session. If provided and impersonation is enabled,
-        #           the request is forwarded to the target user's PUN to delete the session.
+        #   - user: Username who owns the session. When omitted, the owner is
+        #           resolved from the session database. Cross-user requests are
+        #           forwarded to the owner's PUN via impersonation.
         def destroy
           target_user = params[:user]
           session_id = params[:id]
+          current_pun_user = get_current_pun_user
+          session_info = nil
 
-          # If user parameter is provided, use impersonation to delete from user's PUN
-          if target_user.present? && PunManager.impersonation_enabled? && PunManager.internal_api_token.present?
+          # Deleting from another user's PUN context would issue kubectl
+          # against the wrong namespace (see connect). Resolve the owner and
+          # forward cross-user deletes to the owner's PUN.
+          if target_user.blank?
+            session_info = find_session_by_id(session_id)
+            return render_session_not_found unless session_info
+
+            target_user = session_info[:user]
+            Rails.logger.info("Admin API: Resolved session #{session_id} owner to #{target_user}")
+          end
+
+          if should_impersonate?(target_user, current_pun_user)
             Rails.logger.info("Admin API: Deleting session #{session_id} via impersonation (user: #{target_user})")
             return destroy_via_impersonation(session_id, target_user)
           end
 
-          # Fallback: try to find session in accessible directories
-          session_info = find_session_by_id(session_id)
+          return render_impersonation_unavailable(session_id, target_user) unless target_user == current_pun_user
 
-          unless session_info
-            return render json: {
-              status: 'error',
-              message: 'Session not found'
-            }, status: :not_found
-          end
+          # Local path: the current PUN user owns the session
+          session_info ||= find_session_by_id(session_id)
+          return render_session_not_found unless session_info
 
           session = session_info[:session]
           user = session_info[:user]
@@ -824,6 +854,27 @@ module Api
           OodSupport::User.new.name
         rescue StandardError
           ENV['USER'] || 'unknown'
+        end
+
+        def render_session_not_found
+          render json: {
+            status: 'error',
+            message: 'Session not found'
+          }, status: :not_found
+        end
+
+        # Render an explicit error when a cross-user request cannot be
+        # forwarded to the owner's PUN. Evaluating or deleting another user's
+        # session locally would target the wrong k8s namespace and misreport
+        # a running session as completed.
+        def render_impersonation_unavailable(session_id, target_user)
+          Rails.logger.error("Admin API: Cannot act on session #{session_id} owned by #{target_user}: impersonation disabled or token missing")
+          render json: {
+            status: 'error',
+            code: 'IMPERSONATION_UNAVAILABLE',
+            message: "Session #{session_id} belongs to #{target_user}; cross-user access requires impersonation, which is not configured",
+            user: target_user
+          }, status: :service_unavailable
         end
 
         # Determine if we should use impersonation for this request
