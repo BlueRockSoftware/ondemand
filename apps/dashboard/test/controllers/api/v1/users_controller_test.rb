@@ -11,6 +11,18 @@ class Api::V1::UsersControllerTest < ActionDispatch::IntegrationTest
     { 'Authorization' => "Bearer #{token}" }
   end
 
+  # The admin token is validated against ENV['OOD_INTERNAL_API_TOKEN'] (the
+  # chart-generated secret); point it at the test token so authorized requests
+  # pass, and restore it afterwards.
+  setup do
+    @prev_admin_token = ENV['OOD_INTERNAL_API_TOKEN']
+    ENV['OOD_INTERNAL_API_TOKEN'] = ADMIN_TOKEN
+  end
+
+  teardown do
+    ENV['OOD_INTERNAL_API_TOKEN'] = @prev_admin_token
+  end
+
   test 'rejects request without Authorization header' do
     post '/api/v1/users/provision', params: { sub: SUB, preferred_username: EMAIL }
     assert_response :unauthorized
@@ -20,6 +32,13 @@ class Api::V1::UsersControllerTest < ActionDispatch::IntegrationTest
     post '/api/v1/users/provision',
          params: { sub: SUB, preferred_username: EMAIL },
          headers: auth_headers('not-an-admin-token')
+    assert_response :unauthorized
+  end
+
+  test 'rejects a token with the admin prefix but the wrong secret' do
+    post '/api/v1/users/provision',
+         params: { sub: SUB, preferred_username: EMAIL },
+         headers: auth_headers('ood-api-admin-wrong-secret')
     assert_response :unauthorized
   end
 

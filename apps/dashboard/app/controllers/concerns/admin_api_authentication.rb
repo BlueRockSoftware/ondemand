@@ -37,11 +37,19 @@ module AdminApiAuthentication
     true
   end
 
-  # Validate an admin token.
-  # TODO: Implement proper token validation with database storage
-  #   (accept tokens by prefix only for now; in production validate against
-  #   stored admin tokens, check expiration, etc.)
+  # Validate an admin token against the deployment's configured secret.
+  #
+  # The token is the generated OOD_INTERNAL_API_TOKEN (minted with the
+  # `ood-api-admin-` prefix by the chart's ood-internal-token Secret and
+  # injected into the PUN env via pun_custom_env_declarations). We compare the
+  # FULL value, not just the prefix — the prefix is public, so a prefix-only
+  # check accepts any caller. Fails closed when no secret is configured, and
+  # uses a constant-time comparison to avoid leaking the token via timing.
   def validate_admin_token(token)
-    token.start_with?('ood-api-admin-')
+    expected = ENV['OOD_INTERNAL_API_TOKEN'].to_s
+    return false if expected.empty?
+    return false unless token.to_s.start_with?('ood-api-admin-')
+
+    ActiveSupport::SecurityUtils.secure_compare(token.to_s, expected)
   end
 end
