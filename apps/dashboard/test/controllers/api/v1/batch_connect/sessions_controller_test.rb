@@ -356,4 +356,176 @@ class Api::V1::BatchConnect::SessionsControllerTest < ActionDispatch::Integratio
       assert_equal %w[unknown unknown], sessions_by_id.fetch('active').values_at('status', 'status_source')
     end
   end
+
+  # --- create ---
+
+  # A valid app + session stubbed at the controller boundary, so create's
+  # request handling (params, validation, response shape) is exercised without
+  # a real cluster.
+  def stub_app_and_session(session: stub(id: 'sess-123', job_id: 'job-1', created_at: '2026-01-01T00:00:00Z'))
+    app = mock('app')
+    app.stubs(:valid?).returns(true)
+    app.stubs(:clusters).returns([stub(id: 'cluster1')])
+    context = mock('context')
+    context.stubs(:attributes=)
+    context.stubs(:valid?).returns(true)
+    app.stubs(:build_session_context).returns(context)
+    BatchConnect::App.stubs(:from_token).returns(app)
+    controller_stubs.stubs(:store_volume_metadata)
+    controller_stubs.stubs(:create_session_for_user).returns(session)
+    app
+  end
+
+  test 'create requires authentication' do
+    post '/api/v1/batch_connect/sessions',
+         params: { target_user: OWNER, app_token: 'sys/bc_jupyter', context: { container: 'x' } }
+    assert_response :unauthorized
+  end
+
+  test 'create returns 400 when target_user is missing' do
+    post '/api/v1/batch_connect/sessions',
+         params: { app_token: 'sys/bc_jupyter', context: { container: 'x' } },
+         headers: auth_headers
+    assert_response :bad_request
+    assert_match(/target_user/, JSON.parse(response.body)['message'])
+  end
+
+  test 'create returns 400 for an invalid storage_path' do
+    post '/api/v1/batch_connect/sessions',
+         params: {
+           target_user: OWNER, app_token: 'sys/bc_jupyter',
+           context: { container: 'x' }, storage_path: '/etc/passwd'
+         },
+         headers: auth_headers
+    assert_response :bad_request
+    assert_match(/storage_path/, JSON.parse(response.body)['message'])
+  end
+
+  test 'create returns 404 when the app token is unknown' do
+    BatchConnect::App.stubs(:from_token).returns(nil)
+    post '/api/v1/batch_connect/sessions',
+         params: { target_user: OWNER, app_token: 'sys/bogus', context: { container: 'x' } },
+         headers: auth_headers
+    assert_response :not_found
+  end
+
+  test 'create returns 201 with the session id and url on success' do
+    stub_app_and_session
+    post '/api/v1/batch_connect/sessions',
+         params: { target_user: OWNER, app_token: 'sys/bc_jupyter', context: { container: 'SciPy Notebook' } },
+         headers: auth_headers
+    assert_response :created
+    body = JSON.parse(response.body)
+    assert_equal 'success', body['status']
+    assert_equal 'sess-123', body['id']
+    assert_equal 'sess-123', body['session_id']
+    assert_equal OWNER, body['user']
+    assert_equal '/batch_connect/sessions/sess-123', body['session_url']
+  end
+
+  test 'create echoes volume_session_id when provided' do
+    stub_app_and_session
+    post '/api/v1/batch_connect/sessions',
+         params: {
+           target_user: OWNER, app_token: 'sys/bc_jupyter',
+           context: { container: 'SciPy Notebook' },
+           storage_path: 'volumes/vol-1', volume_session_id: 'vsid-9'
+         },
+         headers: auth_headers
+    assert_response :created
+    assert_equal 'vsid-9', JSON.parse(response.body)['volume_session_id']
+  end
+
+  test 'create returns 422 when session creation yields nothing' do
+    stub_app_and_session(session: nil)
+    post '/api/v1/batch_connect/sessions',
+         params: { target_user: OWNER, app_token: 'sys/bc_jupyter', context: { container: 'x' } },
+         headers: auth_headers
+    assert_response :unprocessable_entity
+  end
+
+  # --- apps ---
+
+  def stub_app_listing(name: 'bc_jupyter', token: 'sys/bc_jupyter', type: :sys)
+    app = mock('listed_app')
+    app.stubs(:type).returns(type)
+    app.stubs(:name).returns(name)
+    app.stubs(:token).returns(token)
+    app.stubs(:title).returns('Jupyter')
+    app.stubs(:manifest).returns(stub(description: 'Launch Jupyter'))
+    app.stubs(:icon_uri).returns('/icon')
+    app
+  end
+
+  test 'apps requires authentication' do
+    get '/api/v1/batch_connect/sessions/apps'
+    assert_response :unauthorized
+  end
+
+  test 'apps lists batch connect apps with their containers' do
+    SysRouter.stubs(:apps).returns([stub_app_listing])
+    controller_stubs.stubs(:extract_containers).returns([])
+
+    get '/api/v1/batch_connect/sessions/apps', headers: auth_headers
+
+    assert_response :success
+    body = JSON.parse(response.body)
+    assert_equal 'success', body['status']
+    assert_equal 'sys/bc_jupyter', body['apps'].first['token']
+    assert_equal [], body['apps'].first['containers']
+  end
+
+  test 'apps excludes non-sys and non-bc apps' do
+    SysRouter.stubs(:apps).returns([
+                                     stub_app_listing(name: 'bc_jupyter', token: 'sys/bc_jupyter', type: :sys),
+                                     stub_app_listing(name: 'files', token: 'sys/files', type: :sys),
+                                     stub_app_listing(name: 'bc_jupyter', token: 'usr/bc_jupyter', type: :usr)
+                                   ])
+    controller_stubs.stubs(:extract_containers).returns([])
+
+    get '/api/v1/batch_connect/sessions/apps', headers: auth_headers
+
+    assert_response :success
+    tokens = JSON.parse(response.body)['apps'].map { |a| a['token'] }
+    assert_equal ['sys/bc_jupyter'], tokens
+  end
+
+  # --- app_details ---
+
+  test 'app_details requires authentication' do
+    get '/api/v1/batch_connect/sessions/app_details', params: { token: 'sys/bc_jupyter' }
+    assert_response :unauthorized
+  end
+
+  test 'app_details returns 400 when token is missing' do
+    get '/api/v1/batch_connect/sessions/app_details', headers: auth_headers
+    assert_response :bad_request
+  end
+
+  test 'app_details returns 404 for an unknown app' do
+    BatchConnect::App.stubs(:from_token).returns(nil)
+    get '/api/v1/batch_connect/sessions/app_details',
+        params: { token: 'sys/bogus' }, headers: auth_headers
+    assert_response :not_found
+  end
+
+  test 'app_details returns the app metadata and attributes' do
+    app = mock('app')
+    app.stubs(:valid?).returns(true)
+    app.stubs(:token).returns('sys/bc_jupyter')
+    app.stubs(:title).returns('Jupyter')
+    app.stubs(:description).returns('Launch Jupyter')
+    app.stubs(:icon_uri).returns('/icon')
+    app.stubs(:attributes).returns([])
+    BatchConnect::App.stubs(:from_token).returns(app)
+
+    get '/api/v1/batch_connect/sessions/app_details',
+        params: { token: 'sys/bc_jupyter' }, headers: auth_headers
+
+    assert_response :success
+    body = JSON.parse(response.body)
+    assert_equal 'success', body['status']
+    assert_equal 'sys/bc_jupyter', body['app']['token']
+    assert_equal [], body['app']['attributes']
+  end
 end
