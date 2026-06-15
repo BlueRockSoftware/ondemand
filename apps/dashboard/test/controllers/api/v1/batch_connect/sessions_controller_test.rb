@@ -446,8 +446,12 @@ class Api::V1::BatchConnect::SessionsControllerTest < ActionDispatch::Integratio
 
   # --- apps ---
 
+  # stub_everything (not mock): SysRouter.apps feeds both the apps action and
+  # the global nav builder (application_controller#nav_sys_apps calls
+  # should_appear_in_nav? on each), so unstubbed nav methods must no-op rather
+  # than raise an unexpected-invocation error.
   def stub_app_listing(name: 'bc_jupyter', token: 'sys/bc_jupyter', type: :sys)
-    app = mock('listed_app')
+    app = stub_everything('listed_app')
     app.stubs(:type).returns(type)
     app.stubs(:name).returns(name)
     app.stubs(:token).returns(token)
