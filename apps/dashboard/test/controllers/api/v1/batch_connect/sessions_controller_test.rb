@@ -37,7 +37,15 @@ class Api::V1::BatchConnect::SessionsControllerTest < ActionDispatch::Integratio
   end
 
   setup do
+    # The admin token is validated against ENV['OOD_INTERNAL_API_TOKEN'];
+    # point it at the test token so authorized requests pass.
+    @prev_admin_token = ENV['OOD_INTERNAL_API_TOKEN']
+    ENV['OOD_INTERNAL_API_TOKEN'] = ADMIN_TOKEN
     controller_stubs.stubs(:get_current_pun_user).returns(ADMIN_USER)
+  end
+
+  teardown do
+    ENV['OOD_INTERNAL_API_TOKEN'] = @prev_admin_token
   end
 
   # --- connect ---
