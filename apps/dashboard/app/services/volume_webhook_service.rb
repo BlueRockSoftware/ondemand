@@ -116,7 +116,45 @@ class VolumeWebhookService
       payload[:exit_code] = exit_code.to_i if exit_code.present?
       payload[:exit_reason] = exit_reason.to_s if exit_reason.present?
 
+      # Immutable image digest the session ran on, for lock-time reproducibility
+      # capture (spec 046, FR-008). Optional; absent => Volume API leaves the
+      # session's image_digest NULL (recorded as unverified at lock).
+      image_digest = session_image_digest(session)
+      payload[:image_digest] = image_digest if image_digest.present?
+
       payload
+    end
+
+    # Extract the running image digest (repo@sha256:...) from the session's k8s
+    # pod status. The OOD Kubernetes adapter surfaces the pod via session.info;
+    # `status.containerStatuses[].imageID` is the immutable digest reference.
+    # Defensive across the info shapes the adapter may return.
+    #
+    # @param session [BatchConnect::Session] The session
+    # @return [String, nil] repo@sha256:... digest if resolvable
+    def session_image_digest(session)
+      info = session.info.to_h rescue {}
+      # Explicit field if a future adapter version provides it directly.
+      digest = info[:image_digest] || info['image_digest']
+      return digest if digest.present?
+
+      native = info[:native] || info['native'] || {}
+      statuses =
+        native.dig(:status, :containerStatuses) ||
+        native.dig('status', 'containerStatuses') ||
+        []
+      Array(statuses).each do |cs|
+        image_id = (cs[:imageID] || cs['imageID']).to_s
+        # imageID is typically "<repo>@sha256:<hex>" (may carry a docker-pullable
+        # prefix); keep only the canonical "<repo>@sha256:<hex>" portion.
+        if image_id =~ %r{([a-z0-9._/-]+@sha256:[a-f0-9]{64})}
+          return Regexp.last_match(1)
+        end
+      end
+      nil
+    rescue StandardError => e
+      Rails.logger.warn("VolumeWebhookService: could not resolve image digest: #{e.class} - #{e.message}")
+      nil
     end
 
     # Send the webhook asynchronously in a background thread
