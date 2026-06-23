@@ -2,9 +2,12 @@
 # if the files changed glob match any of the defined rules in .github/labeler.yml
 name: Pull Request Labeler
 
+# Fork: auto-labeling is disabled. Upstream relies on an OSC org secret/label
+# set this fork doesn't have, so the "Add labels to PR" check failed on every
+# PR with no value to us. Left as manual-only (workflow_dispatch) rather than
+# deleted, so it can be re-enabled if the fork ever defines its own labels.
 on:
   workflow_dispatch:
-  pull_request_target:
 
 permissions:
   contents: read

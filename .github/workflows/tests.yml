@@ -12,7 +12,47 @@ env:
   ACTIONS_RUNNER_DEBUG: true
 
 jobs:
+  # Fork addition: detect whether a PR changes upstream app/Ruby code or only
+  # our fork-specific infra (the k8s-bootstrap hooks). The upstream Ruby unit
+  # and packaging e2e suites are not kept green in this fork and do not cover
+  # infra-only changes, so they are gated to run only when app code changes (or
+  # on non-PR events). The Kubernetes-bootstrap test below is intentionally NOT
+  # gated -- it exercises our hook and must run on every PR.
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      infra_only: ${{ steps.classify.outputs.infra_only }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      # Transparent classification (no third-party action / ambiguous glob
+      # semantics): infra_only is true when EVERY file changed by this PR lives
+      # under our fork infra paths (k8s-bootstrap hooks, the example hook.env,
+      # or CI workflows). Any other changed file -> infra_only=false -> the
+      # upstream Ruby unit/e2e suites run.
+      - id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          files=$(git diff --name-only "$base" "$HEAD_SHA")
+          echo "Changed files:"; echo "$files"
+          noninfra=$(echo "$files" | grep -vE '^(hooks/k8s-bootstrap/|hooks/hook\.env\.example$|\.github/)' || true)
+          if [ -z "$noninfra" ]; then
+            echo "infra_only=true" >> "$GITHUB_OUTPUT"
+            echo "Result: infra_only=true (no non-infra files changed)"
+          else
+            echo "infra_only=false" >> "$GITHUB_OUTPUT"
+            echo "Result: infra_only=false; non-infra files:"; echo "$noninfra"
+          fi
+
   unit-tests:
+    needs: changes
+    # Skip on PRs that touch ONLY fork infra; always run on push/schedule.
+    if: ${{ always() && (github.event_name != 'pull_request' || needs.changes.outputs.infra_only != 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -121,6 +161,9 @@ jobs:
         run: /bin/bash hooks/k8s-bootstrap/k8s-bootstrap-ondemand.sh test hooks/hook.env.example
 
   e2e-tests:
+    needs: changes
+    # Skip on PRs that touch ONLY fork infra; always run on push/schedule.
+    if: ${{ always() && (github.event_name != 'pull_request' || needs.changes.outputs.infra_only != 'true') }}
     strategy:
       fail-fast: false
       matrix:
