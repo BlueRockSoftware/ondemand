@@ -50,6 +50,7 @@ TMPFILE=$(mktemp "/tmp/k8-ondemand-bootstrap-${ONDEMAND_USERNAME}.XXXXXX")
   envsubst < "${YAML_DIR}/namespace.yaml"
   envsubst < "${YAML_DIR}/network-policy.yaml"
   envsubst < "${YAML_DIR}/deny-egress-restricted.yaml"
+  envsubst < "${YAML_DIR}/deny-egress-locked.yaml"
   envsubst < "${YAML_DIR}/rolebinding.yaml"
 } > "$TMPFILE"
 
