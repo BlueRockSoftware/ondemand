@@ -14,6 +14,11 @@ require 'json'
 #                            OOD_REGISTRY_URL, then DEFAULT_REGISTRY_URL.
 #   OOD_REGISTRY_URL       - Bare registry path for image refs (no scheme);
 #                            used here only as a backward-compat fallback.
+#   OOD_REGISTRY_DOCKERCONFIG - Docker config JSON (the image-pull secret's
+#                            .dockerconfigjson). Parsed for per-host credentials
+#                            to perform the registry's Bearer-token handshake
+#                            (required by ghcr.io). Optional: plain-HTTP/anonymous
+#                            registries need no token and ignore this.
 #   OOD_REGISTRY_CACHE_TTL - Cache TTL in seconds (default: 300)
 #
 # Usage:
@@ -24,7 +29,17 @@ class RegistryService
   HTTP_TIMEOUT = 5
   DEFAULT_REGISTRY_URL = "172.20.26.108:5000/deap"
   DEFAULT_CACHE_TTL = 300
-  MANIFEST_ACCEPT = "application/vnd.docker.distribution.manifest.v2+json"
+  # Token lifetime is conservative: ghcr issues ~5-minute tokens, so reuse the
+  # one token across a single image's tag + per-tag digest calls.
+  TOKEN_TTL = 240
+  # Accept the full manifest/index set so multi-arch images (an OCI image index
+  # on ghcr) resolve to their top-level digest, matching what a pull would use.
+  MANIFEST_ACCEPT = [
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.oci.image.index.v1+json"
+  ].join(", ")
 
   class << self
     # Fetch versions (tags + digests) for a container image.
@@ -67,9 +82,11 @@ class RegistryService
       current&.dig(:tag)
     end
 
-    # Clear the in-memory cache (useful for testing).
+    # Clear the in-memory caches (useful for testing).
     def clear_cache!
       @cache = {}
+      @token_cache = {}
+      @docker_config = nil
     end
 
     private
@@ -87,14 +104,19 @@ class RegistryService
       Integer(ENV.fetch("OOD_REGISTRY_CACHE_TTL", DEFAULT_CACHE_TTL))
     end
 
-    # Parse registry_url into API base and repository prefix.
-    # "172.20.26.108:5000/deap" => base="http://172.20.26.108:5000", prefix="deap"
+    # Parse registry_url into API base and repository prefix. A bare value (no
+    # scheme) defaults to plain HTTP, matching the in-cluster registry; an
+    # explicit scheme is honored (ghcr.io needs HTTPS).
+    #   "https://ghcr.io/deap-science" => base="https://ghcr.io",          prefix="deap-science"
+    #   "172.20.26.108:5000/deap"      => base="http://172.20.26.108:5000", prefix="deap"
     def registry_parts
       url = registry_url
-      parts = url.split("/", 2)
-      host_port = parts[0]
-      prefix = parts[1] || ""
-      base = host_port.start_with?("http") ? host_port : "http://#{host_port}"
+      url = "http://#{url}" unless url.match?(%r{\Ahttps?://})
+      uri = URI.parse(url)
+
+      base = "#{uri.scheme}://#{uri.host}"
+      base += ":#{uri.port}" if uri.port && uri.port != uri.default_port
+      prefix = uri.path.sub(%r{\A/+}, "")
       [base, prefix]
     end
 
@@ -103,7 +125,7 @@ class RegistryService
       repo = prefix.empty? ? image_name : "#{prefix}/#{image_name}"
       uri = URI.parse("#{base}/v2/#{repo}/tags/list")
 
-      response = http_get(uri)
+      response = authorized_request(:get, uri)
       return [] unless response.is_a?(Net::HTTPSuccess)
 
       data = JSON.parse(response.body)
@@ -118,7 +140,7 @@ class RegistryService
       repo = prefix.empty? ? image_name : "#{prefix}/#{image_name}"
       uri = URI.parse("#{base}/v2/#{repo}/manifests/#{tag}")
 
-      response = http_head(uri, { "Accept" => MANIFEST_ACCEPT })
+      response = authorized_request(:head, uri, { "Accept" => MANIFEST_ACCEPT })
       return nil unless response.is_a?(Net::HTTPSuccess)
 
       response["Docker-Content-Digest"]
@@ -127,17 +149,89 @@ class RegistryService
       nil
     end
 
-    def http_get(uri)
-      Net::HTTP.start(uri.host, uri.port, open_timeout: HTTP_TIMEOUT, read_timeout: HTTP_TIMEOUT) do |http|
-        http.get(uri.request_uri)
+    # Perform a registry request, transparently satisfying a Docker Registry v2
+    # Bearer-token challenge (ghcr.io) by fetching a token and retrying once.
+    # Plain/anonymous registries return success on the first try and are untouched.
+    def authorized_request(method, uri, headers = {})
+      response = http_request(method, uri, headers)
+      return response unless response.is_a?(Net::HTTPUnauthorized)
+
+      challenge = parse_bearer_challenge(response["WWW-Authenticate"])
+      return response unless challenge
+
+      token = bearer_token(challenge, uri.host)
+      return response unless token
+
+      http_request(method, uri, headers.merge("Authorization" => "Bearer #{token}"))
+    end
+
+    def http_request(method, uri, headers = {})
+      request_class = method == :head ? Net::HTTP::Head : Net::HTTP::Get
+      request = request_class.new(uri.request_uri, headers)
+      Net::HTTP.start(uri.host, uri.port, use_ssl: uri.is_a?(URI::HTTPS),
+                      open_timeout: HTTP_TIMEOUT, read_timeout: HTTP_TIMEOUT) do |http|
+        http.request(request)
       end
     end
 
-    def http_head(uri, headers = {})
-      req = Net::HTTP::Head.new(uri.request_uri, headers)
-      Net::HTTP.start(uri.host, uri.port, open_timeout: HTTP_TIMEOUT, read_timeout: HTTP_TIMEOUT) do |http|
-        http.request(req)
-      end
+    # Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
+    # header into a params hash, or nil if it is not a Bearer challenge.
+    def parse_bearer_challenge(header)
+      return nil unless header.to_s.start_with?("Bearer ")
+
+      params = header.sub(/\ABearer\s+/, "").scan(/(\w+)="([^"]*)"/).to_h
+      params["realm"] ? params : nil
+    end
+
+    # Exchange a Bearer challenge for an access token, authenticating to the
+    # token endpoint with the registry host's docker-config credentials when
+    # available. Tokens are cached per scope for their (short) lifetime so a
+    # single versions_for refresh reuses one token across all its requests.
+    def bearer_token(challenge, registry_host)
+      scope = challenge["scope"].to_s
+      cached = token_cache[scope]
+      return cached[:token] if cached && cached[:expires_at] > Time.now
+
+      realm = URI.parse(challenge["realm"])
+      query = { "service" => challenge["service"], "scope" => challenge["scope"] }.compact
+      realm.query = URI.encode_www_form(query) unless query.empty?
+
+      headers = {}
+      basic = registry_basic_auth(registry_host)
+      headers["Authorization"] = "Basic #{basic}" if basic
+
+      response = http_request(:get, realm, headers)
+      return nil unless response.is_a?(Net::HTTPSuccess)
+
+      token = JSON.parse(response.body).values_at("token", "access_token").compact.first
+      token_cache[scope] = { token: token, expires_at: Time.now + TOKEN_TTL } if token
+      token
+    rescue StandardError => e
+      Rails.logger.warn("RegistryService: token handshake failed for #{registry_host}: #{e.message}")
+      nil
+    end
+
+    # Base64 `user:password` for a registry host from the docker config, or nil.
+    # The docker config's `auth` field is already base64(user:password), which is
+    # exactly the credential the token endpoint expects for HTTP Basic auth.
+    def registry_basic_auth(host)
+      auths = docker_config["auths"] || {}
+      entry = auths[host] || auths["https://#{host}"] || auths["http://#{host}"]
+      entry && entry["auth"]
+    end
+
+    def docker_config
+      raw = ENV["OOD_REGISTRY_DOCKERCONFIG"]
+      return {} if raw.nil? || raw.empty?
+
+      @docker_config ||= JSON.parse(raw)
+    rescue JSON::ParserError => e
+      Rails.logger.warn("RegistryService: invalid OOD_REGISTRY_DOCKERCONFIG: #{e.message}")
+      {}
+    end
+
+    def token_cache
+      @token_cache ||= {}
     end
 
     # Sort versions by semver descending; mark highest as current.
