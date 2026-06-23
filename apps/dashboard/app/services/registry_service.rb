@@ -9,7 +9,11 @@ require 'json'
 # network calls. Determines the "current" version as the highest semver tag.
 #
 # Configuration (environment variables):
-#   OOD_REGISTRY_URL       - Registry path (default: 172.20.26.108:5000/deap)
+#   OOD_REGISTRY_API_URL   - Docker v2 API endpoint, with scheme
+#                            (e.g. https://ghcr.io/deap-science). Falls back to
+#                            OOD_REGISTRY_URL, then DEFAULT_REGISTRY_URL.
+#   OOD_REGISTRY_URL       - Bare registry path for image refs (no scheme);
+#                            used here only as a backward-compat fallback.
 #   OOD_REGISTRY_CACHE_TTL - Cache TTL in seconds (default: 300)
 #
 # Usage:
@@ -70,8 +74,13 @@ class RegistryService
 
     private
 
+    # API base for Docker v2 calls. Prefers OOD_REGISTRY_API_URL (carries an
+    # explicit scheme so ghcr.io is reached over HTTPS). OOD_REGISTRY_URL is the
+    # bare host[:port]/prefix the session submit templates interpolate into
+    # Kubernetes image references, where a scheme is invalid; it is only a
+    # backward-compat fallback here.
     def registry_url
-      ENV.fetch("OOD_REGISTRY_URL", DEFAULT_REGISTRY_URL)
+      ENV["OOD_REGISTRY_API_URL"] || ENV.fetch("OOD_REGISTRY_URL", DEFAULT_REGISTRY_URL)
     end
 
     def cache_ttl
