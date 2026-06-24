@@ -1,11 +1,20 @@
 ---
 # Full-lockdown egress policy for sessions started with allow_outbound=false
-# ("no internet at all"). Identical to deny-egress-restricted.yaml EXCEPT it
-# omits the egress-proxy (:3128) rule, so a locked session cannot reach the
-# Posit Package Manager (or anything else on the internet) -- it can only do
-# DNS, in-cluster traffic, and the API-server lookup its init container needs.
-# Restricted (Posit-only) sessions use the proxy rule in deny-egress-restricted
-# instead; the two policies are mutually exclusive via distinct pod labels
+# ("no internet at all"). Allows ONLY DNS and the API-server lookup the session
+# init container needs -- deliberately NOT general in-cluster traffic.
+#
+# Why no pod/service-CIDR allowance (unlike deny-egress-restricted): the
+# egress-proxy is an in-cluster pod (its IP is in the pod CIDR), so allowing the
+# pod/service CIDRs lets a locked session reach the proxy (<svc>:3128 -> proxy
+# pod) and CONNECT-tunnel to the Posit Package Manager -- defeating "no
+# internet". Calico evaluates egress against the POST-DNAT pod IP, so a broad
+# pod-CIDR rule covers the proxy even without an explicit :3128 rule (simply
+# omitting the proxy rule from deny-egress-restricted was NOT enough). Limiting
+# locked egress to DNS + API keeps sessions starting while truly blocking the
+# proxy. Verified: a locked pod's curl to egress-proxy:3128 times out, while DNS
+# resolution and the API lookup still succeed.
+#
+# Mutually exclusive with deny-egress-restricted via distinct pod labels
 # (ood-outbound-locked vs ood-outbound-restricted), never both on one pod.
 kind: NetworkPolicy
 apiVersion: networking.k8s.io/v1
@@ -19,25 +28,21 @@ spec:
   policyTypes:
   - Egress
   egress:
+  # DNS to any resolver (the response is allowed by conntrack). No destination
+  # restriction so resolution works regardless of the kube-dns ClusterIP/backend.
   - ports:
     - protocol: UDP
       port: 53
     - protocol: TCP
       port: 53
-  - to:
-    - ipBlock:
-        cidr: $NETWORK_POLICY_ALLOW_CIDR
-    - ipBlock:
-        cidr: 10.96.0.0/12
   # In-cluster Kubernetes API server. The session init container
   # (get_host_port.py) reads its Service/ConfigMap to discover the connection
   # host:port; without this a locked session never starts. The API ClusterIP
   # (10.96.0.1:443) DNATs to a control-plane node IP on :6443, and Calico
-  # evaluates egress against that post-DNAT node IP -- which the pod/service
-  # CIDRs above don't cover -- so the node subnet must be allowed on :6443.
-  # NETWORK_POLICY_ALLOW_API_CIDR defaults to POD_CIDR when a cluster sets no
-  # API_SERVER_CIDR (a harmless duplicate; locked sessions on such a cluster
-  # remain broken until it is set, same as deny-egress-restricted).
+  # evaluates egress against that post-DNAT node IP, so the node subnet must be
+  # allowed on :6443. NETWORK_POLICY_ALLOW_API_CIDR defaults to POD_CIDR when a
+  # cluster sets no API_SERVER_CIDR; even then only :6443 is opened, so the
+  # egress-proxy (a different port, :3128) stays blocked.
   - to:
     - ipBlock:
         cidr: $NETWORK_POLICY_ALLOW_API_CIDR
