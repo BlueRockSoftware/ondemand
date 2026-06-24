@@ -197,8 +197,12 @@ class VolumeWebhookService
       request['Content-Type'] = 'application/json'
       request['Accept'] = 'application/json'
 
-      # Add bearer token if configured
-      volume_api_token = ENV['VOLUME_API_TOKEN']
+      # Add bearer token if configured. Prefer OOD_VOLUME_API_TOKEN: the PUN env
+      # is built across a sudo boundary that keeps only OOD_* vars, so the bare
+      # VOLUME_API_TOKEN is nil in the Rails worker and the teardown webhook
+      # would post unauthenticated (401, reclamation lost). Fall back to the
+      # bare name for non-PUN contexts (e.g. tests).
+      volume_api_token = ENV['OOD_VOLUME_API_TOKEN'].presence || ENV['VOLUME_API_TOKEN']
       request['Authorization'] = "Bearer #{volume_api_token}" if volume_api_token.present?
 
       request.body = payload.to_json

@@ -13,8 +13,10 @@ require 'openssl'
 # VolumeWebhookService; the only method is a single admin lookup.
 #
 # Configuration (same env as VolumeWebhookService):
-#   - VOLUME_API_URL   base URL of the Volume API
-#   - VOLUME_API_TOKEN service bearer token
+#   - VOLUME_API_URL          base URL of the Volume API
+#   - OOD_VOLUME_API_TOKEN    service bearer token (preferred; survives the
+#                             OOD_*-only PUN env scrub), falling back to
+#                             VOLUME_API_TOKEN outside the PUN (e.g. tests)
 class VolumeApiClient
   # Timeout for the validation request (seconds). Short: this is on the session
   # create path and must fail fast rather than hang a launch.
@@ -39,7 +41,13 @@ class VolumeApiClient
 
       request = Net::HTTP::Get.new(uri.request_uri)
       request['Accept'] = 'application/json'
-      token = ENV['VOLUME_API_TOKEN']
+      # Prefer the OOD_-prefixed name: the admin/api PUN environment is built
+      # across a sudo boundary whose env_keep preserves only OOD_* vars, so a
+      # bare VOLUME_API_TOKEN is scrubbed to nil in the Rails worker and the
+      # lookup goes out unauthenticated (401 -> validation fails closed). The
+      # chart also exports OOD_VOLUME_API_TOKEN. Fall back to the bare name for
+      # non-PUN contexts (e.g. tests).
+      token = ENV['OOD_VOLUME_API_TOKEN'].presence || ENV['VOLUME_API_TOKEN']
       request['Authorization'] = "Bearer #{token}" if token.present?
 
       response = http.request(request)
