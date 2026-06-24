@@ -423,8 +423,18 @@ class Api::V1::BatchConnect::SessionsControllerTest < ActionDispatch::Integratio
     assert_equal '/batch_connect/sessions/sess-123', body['session_url']
   end
 
+  # A valid, fresh, owned, unconsumed mount handle as returned by the Volume API
+  # admin lookup. Defaults match the storage_path/volume_session_id used below.
+  def valid_volume_session(id: 'vsid-9', user: OWNER, mount_path: 'volumes/vol-1', state: 'ready', container: nil)
+    {
+      'id' => id, 'user_id' => user, 'mount_path' => mount_path,
+      'state' => state, 'container_session_id' => container, 'volume_id' => 'vol-1'
+    }
+  end
+
   test 'create echoes volume_session_id when provided' do
     stub_app_and_session
+    VolumeApiClient.stubs(:get_session).returns(valid_volume_session)
     post '/api/v1/batch_connect/sessions',
          params: {
            target_user: OWNER, app_token: 'sys/bc_jupyter',
@@ -442,6 +452,83 @@ class Api::V1::BatchConnect::SessionsControllerTest < ActionDispatch::Integratio
          params: { target_user: OWNER, app_token: 'sys/bc_jupyter', context: { container: 'x' } },
          headers: auth_headers
     assert_response :unprocessable_entity
+  end
+
+  # --- create: volume-session validation (spec 049) ---
+
+  def post_with_codespace(storage_path: 'volumes/vol-1', volume_session_id: 'vsid-9')
+    params = {
+      target_user: OWNER, app_token: 'sys/bc_jupyter',
+      context: { container: 'SciPy Notebook' }
+    }
+    params[:storage_path] = storage_path unless storage_path.nil?
+    params[:volume_session_id] = volume_session_id unless volume_session_id.nil?
+    post '/api/v1/batch_connect/sessions', params: params, headers: auth_headers
+  end
+
+  test 'create rejects 422 when the volume session is not found (stale/forged)' do
+    stub_app_and_session
+    VolumeApiClient.stubs(:get_session).returns(nil)
+    post_with_codespace
+    assert_response :unprocessable_entity
+    assert_match(/not found or already ended/, JSON.parse(response.body)['message'])
+  end
+
+  test 'create rejects 422 when the volume session belongs to another user' do
+    stub_app_and_session
+    VolumeApiClient.stubs(:get_session).returns(valid_volume_session(user: 'someone_else'))
+    post_with_codespace
+    assert_response :unprocessable_entity
+    assert_match(/does not belong to target_user/, JSON.parse(response.body)['message'])
+  end
+
+  test 'create rejects 422 when mount_path does not match storage_path' do
+    stub_app_and_session
+    VolumeApiClient.stubs(:get_session).returns(valid_volume_session(mount_path: 'volumes/OTHER'))
+    post_with_codespace
+    assert_response :unprocessable_entity
+    assert_match(/does not match the prepared volume session/, JSON.parse(response.body)['message'])
+  end
+
+  test 'create rejects 422 when the volume session is already consumed (in_use)' do
+    stub_app_and_session
+    VolumeApiClient.stubs(:get_session).returns(valid_volume_session(state: 'in_use', container: 'sess-prev'))
+    post_with_codespace
+    assert_response :unprocessable_entity
+    assert_match(/already in use/, JSON.parse(response.body)['message'])
+  end
+
+  test 'create rejects 422 when storage_path is given without a volume_session_id' do
+    stub_app_and_session
+    VolumeApiClient.expects(:get_session).never
+    post_with_codespace(volume_session_id: nil)
+    assert_response :unprocessable_entity
+    assert_match(/missing volume_session_id/, JSON.parse(response.body)['message'])
+  end
+
+  test 'create rejects 422 when the volume service is unavailable' do
+    stub_app_and_session
+    VolumeApiClient.stubs(:get_session).raises(VolumeApiClient::VolumeApiError, 'boom')
+    post_with_codespace
+    assert_response :unprocessable_entity
+    assert_match(/volume service unavailable/, JSON.parse(response.body)['message'])
+  end
+
+  test 'create succeeds 201 with a valid, owned, unconsumed volume session' do
+    stub_app_and_session
+    VolumeApiClient.stubs(:get_session).returns(valid_volume_session)
+    post_with_codespace
+    assert_response :created
+    assert_equal 'vsid-9', JSON.parse(response.body)['volume_session_id']
+  end
+
+  test 'create skips volume validation entirely when no storage_path is given' do
+    stub_app_and_session
+    VolumeApiClient.expects(:get_session).never
+    post '/api/v1/batch_connect/sessions',
+         params: { target_user: OWNER, app_token: 'sys/bc_jupyter', context: { container: 'SciPy Notebook' } },
+         headers: auth_headers
+    assert_response :created
   end
 
   # --- apps ---

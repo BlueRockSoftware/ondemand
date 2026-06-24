@@ -19,6 +19,7 @@ require 'uri'
 require 'json'
 require 'ostruct'
 require_relative '../../../../services/volume_webhook_service'
+require_relative '../../../../services/volume_api_client'
 require_relative '../../../../services/pun_manager'
 require_relative '../../../../services/impersonation_error'
 require_relative '../../../../services/impersonated_session'
@@ -147,6 +148,21 @@ module Api
                 status: 'error',
                 message: validation_error
               }, status: :bad_request
+            end
+
+            # Validate the mount handle against the Volume API before launching, so a
+            # stale / forged / wrong-owner / mismatched value cannot silently mount the
+            # wrong storage (spec 049, FR-002/003/004). Only runs when a codespace
+            # mount is requested (storage_path present); the no-codespace flow is
+            # unaffected. Runs here, before create_session_for_user, so it covers both
+            # the local and impersonation dispatch paths.
+            volume_session_error = validate_volume_session(target_user, storage_path, volume_session_id)
+            if volume_session_error
+              return render json: {
+                status: 'error',
+                code: 'VOLUME_SESSION_INVALID',
+                message: volume_session_error
+              }, status: :unprocessable_entity
             end
           end
 
@@ -1320,6 +1336,40 @@ module Api
           unless storage_path.match?(STORAGE_PATH_PATTERN)
             return 'Invalid storage_path: must contain only alphanumeric characters, hyphens, underscores, and forward slashes'
           end
+
+          nil # Valid
+        end
+
+        # Validate that storage_path + volume_session_id correspond to a fresh,
+        # owned, not-yet-consumed Volume API mount handle (spec 049, FR-002/003/004).
+        #
+        # Returns an error message string describing the cause (without leaking
+        # another user's data), or nil when the handle is valid.
+        #
+        # @param target_user [String] user the session is launched for
+        # @param storage_path [String] the mount location supplied by the caller
+        # @param volume_session_id [String, nil] the mount handle id
+        # @return [String, nil]
+        def validate_volume_session(target_user, storage_path, volume_session_id)
+          return 'missing volume_session_id for storage_path' if volume_session_id.blank?
+
+          begin
+            session = VolumeApiClient.get_session(volume_session_id)
+          rescue VolumeApiClient::VolumeApiError => e
+            Rails.logger.error("Admin API: could not validate volume session #{volume_session_id}: #{e.message}")
+            return 'cannot validate codespace: volume service unavailable'
+          end
+
+          return 'volume session not found or already ended' if session.nil?
+
+          owner = session['user_id'] || session[:user_id]
+          mount_path = session['mount_path'] || session[:mount_path]
+          state = session['state'] || session[:state]
+          linked = session['container_session_id'] || session[:container_session_id]
+
+          return 'volume session does not belong to target_user' unless owner == target_user
+          return 'storage_path does not match the prepared volume session' unless mount_path == storage_path
+          return 'volume session already in use' unless state == 'ready' && linked.nil?
 
           nil # Valid
         end
