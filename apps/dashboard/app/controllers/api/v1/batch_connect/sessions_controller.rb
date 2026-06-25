@@ -209,6 +209,13 @@ module Api
             # Store volume metadata in session info for later retrieval
             store_volume_metadata(session, storage_path, volume_session_id)
 
+            # Mark the mount handle consumed now that the launch succeeded, so the
+            # same volume_session_id cannot be reused (spec 049, US1#5). Done
+            # server-side here -- covering both the local and impersonation
+            # dispatch paths -- so consumption no longer depends on the caller's
+            # optional link step. Best-effort: failure is logged, not fatal.
+            mark_volume_session_consumed(target_user, session.id)
+
             Rails.logger.info("Admin API: Created session #{session.id} for user #{target_user}")
 
             response_data = {
@@ -1371,7 +1378,32 @@ module Api
           return 'storage_path does not match the prepared volume session' unless mount_path == storage_path
           return 'volume session already in use' unless state == 'ready' && linked.nil?
 
+          # Stash the validated handle so create can mark it consumed after a
+          # successful launch (needs its volume_id). See mark_volume_session_consumed.
+          @validated_volume_session = session
           nil # Valid
+        end
+
+        # Mark the validated mount handle as consumed by the just-launched session
+        # (spec 049, US1#5): a successful launch must make its volume_session_id
+        # non-reusable, independent of the optional caller-side link step. Uses the
+        # handle validated in validate_volume_session (for its volume_id) and links
+        # it to the new running session, flipping it to in_use. Best-effort: logged,
+        # never fatal -- a launched session is not rolled back over this.
+        #
+        # @param target_user [String] owner of the handle (X-User-ID for the call)
+        # @param container_session_id [String] the launched OOD session id
+        def mark_volume_session_consumed(target_user, container_session_id)
+          handle = @validated_volume_session
+          return if handle.blank?
+
+          volume_id = handle['volume_id'] || handle[:volume_id]
+          volume_session_id = handle['id'] || handle[:id]
+          return if volume_id.blank? || volume_session_id.blank?
+
+          VolumeApiClient.mark_consumed(target_user, volume_id, volume_session_id, container_session_id)
+        rescue VolumeApiClient::VolumeApiError => e
+          Rails.logger.error("Admin API: could not mark volume session #{volume_session_id} consumed: #{e.message}")
         end
 
         # Store volume metadata in session info
