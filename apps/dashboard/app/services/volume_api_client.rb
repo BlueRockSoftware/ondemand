@@ -68,6 +68,43 @@ class VolumeApiClient
       raise VolumeApiError, "Volume API returned invalid JSON: #{e.message}"
     end
 
+    # Mark a mount handle as consumed by a running session (spec 049, US1#5):
+    # links it to container_session_id and flips it to `in_use`, so a second
+    # launch reusing the same volume_session_id is rejected. The OOD create
+    # path calls this server-side after a successful launch, so consumption no
+    # longer depends on the caller performing the optional link step.
+    #
+    # PATCH /api/v1/volumes/{volume_id}/sessions/{volume_session_id} is
+    # user-scoped (X-User-ID + ownership check), so the handle's owner is passed
+    # as user_id. Best-effort: the caller logs failures rather than rolling back
+    # a launched session.
+    def mark_consumed(user_id, volume_id, volume_session_id, container_session_id)
+      base_url = ENV['VOLUME_API_URL']
+      raise VolumeApiError, 'VOLUME_API_URL not configured' unless base_url.present?
+
+      uri = URI.parse("#{base_url.chomp('/')}/api/v1/volumes/#{volume_id}/sessions/#{volume_session_id}")
+      http = build_http(uri)
+
+      request = Net::HTTP::Patch.new(uri.request_uri)
+      request['Content-Type'] = 'application/json'
+      request['Accept'] = 'application/json'
+      token = ENV['OOD_VOLUME_API_TOKEN'].presence || ENV['VOLUME_API_TOKEN']
+      request['Authorization'] = "Bearer #{token}" if token.present?
+      request['X-User-ID'] = user_id
+      request.body = { container_session_id: container_session_id }.to_json
+
+      response = http.request(request)
+      return JSON.parse(response.body) if response.is_a?(Net::HTTPSuccess)
+
+      raise VolumeApiError, "Volume API returned #{response.code}"
+    rescue Net::OpenTimeout, Net::ReadTimeout => e
+      raise VolumeApiError, "Volume API timeout: #{e.message}"
+    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, SocketError => e
+      raise VolumeApiError, "Volume API unreachable: #{e.class} - #{e.message}"
+    rescue JSON::ParserError => e
+      raise VolumeApiError, "Volume API returned invalid JSON: #{e.message}"
+    end
+
     private
 
     def build_http(uri)

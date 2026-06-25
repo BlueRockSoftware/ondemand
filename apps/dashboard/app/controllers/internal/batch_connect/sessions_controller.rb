@@ -139,6 +139,14 @@ module Internal
           }, status: :internal_server_error
         end
 
+        # Persist the volume handle id onto the session so teardown can forward it
+        # in the session-ended webhook (spec 049, FR-007). This path runs in the
+        # owner's PUN during impersonated create, so it -- not the admin
+        # controller's store_volume_metadata (which can't reach this session's
+        # info) -- is what records the id for reclamation. Without it the teardown
+        # webhook skips (no volume_session_id) and the handle leaks.
+        store_volume_metadata(session, storage_path, volume_session_id)
+
         Rails.logger.info("Internal API: Created session #{session.id} for #{current_user.name}")
 
         render json: {
@@ -277,6 +285,20 @@ module Internal
       end
 
       private
+
+      # Persist volume mount metadata onto the session's info so teardown can
+      # forward volume_session_id in the session-ended webhook (spec 049). Mirrors
+      # the admin controller's helper; best-effort.
+      def store_volume_metadata(session, storage_path, volume_session_id)
+        return unless storage_path.present? || volume_session_id.present?
+
+        info = session.info.to_h rescue {}
+        info[:storage_path] = storage_path if storage_path.present?
+        info[:volume_session_id] = volume_session_id if volume_session_id.present?
+        session.info = info if session.respond_to?(:info=)
+      rescue StandardError => e
+        Rails.logger.warn("Internal API: could not store volume metadata for session #{session.id}: #{e.message}")
+      end
 
       # Send the volume session-ended webhook (fire-and-forget). Mirrors the
       # admin controller's helper; failures are logged but never block the

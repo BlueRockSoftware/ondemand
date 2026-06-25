@@ -47,4 +47,31 @@ class Internal::BatchConnect::SessionsControllerTest < ActionDispatch::Integrati
     delete '/internal/batch_connect/sessions/missing'
     assert_response :not_found
   end
+
+  # G1: impersonated create runs here, so this path -- not the admin controller's
+  # store_volume_metadata (which can't reach this session's info) -- must persist
+  # volume_session_id, or the teardown webhook later finds nothing to forward.
+  test 'create persists volume_session_id onto the session info' do
+    app = stub('app', valid?: true)
+    context = stub('context', valid?: true)
+    context.stubs(:attributes=)
+    app.stubs(:build_session_context).returns(context)
+    ::BatchConnect::App.stubs(:from_token).returns(app)
+
+    session = mock('session')
+    session.stubs(:save).returns(true)
+    session.stubs(:info).returns({})
+    session.stubs(:id).returns('sess-1')
+    session.stubs(:job_id).returns('job-1')
+    session.stubs(:created_at).returns(Time.now)
+    # The assertion: the volume_session_id is written back onto the session info.
+    session.expects(:info=).with { |i| i[:volume_session_id] == 'vsid-9' }
+    session.stubs(:respond_to?).with(:info=).returns(true)
+    ::BatchConnect::Session.stubs(:new).returns(session)
+
+    post '/internal/batch_connect/sessions',
+         params: { app_token: 'sys/bc_jupyter', context: { cluster: 'x' },
+                   storage_path: 'mnt/p', volume_session_id: 'vsid-9' }
+    assert_response :created
+  end
 end

@@ -92,4 +92,31 @@ class VolumeApiClientTest < ActiveSupport::TestCase
     end
     assert_equal 'Bearer vol-token', captured
   end
+
+  test 'mark_consumed PATCHes the user-scoped link endpoint with the container id' do
+    req_seen = nil
+    env = ENV_VOLUME.merge('OOD_VOLUME_API_TOKEN' => 'ood-token')
+    with_modified_env(env) do
+      Net::HTTP.any_instance.stubs(:request).with do |req|
+        req_seen = req
+        true
+      end.returns(http_ok({ id: 'vsid-1', state: 'in_use', container_session_id: 'sess-9' }.to_json))
+      VolumeApiClient.mark_consumed('chris', 'vol-7', 'vsid-1', 'sess-9')
+    end
+    assert_kind_of Net::HTTP::Patch, req_seen
+    assert_equal '/api/v1/volumes/vol-7/sessions/vsid-1', req_seen.path
+    assert_equal 'Bearer ood-token', req_seen['Authorization']
+    assert_equal 'chris', req_seen['X-User-ID']
+    assert_equal({ 'container_session_id' => 'sess-9' }, JSON.parse(req_seen.body))
+  end
+
+  test 'mark_consumed raises VolumeApiError on a non-success response' do
+    with_modified_env(ENV_VOLUME) do
+      Net::HTTP.any_instance.stubs(:request)
+               .returns(http_status(Net::HTTPConflict, '409', 'Conflict'))
+      assert_raises(VolumeApiClient::VolumeApiError) do
+        VolumeApiClient.mark_consumed('u', 'v', 's', 'c')
+      end
+    end
+  end
 end
