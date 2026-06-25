@@ -65,4 +65,31 @@ class VolumeApiClientTest < ActiveSupport::TestCase
       assert_raises(VolumeApiClient::VolumeApiError) { VolumeApiClient.get_session('x') }
     end
   end
+
+  test 'get_session prefers OOD_VOLUME_API_TOKEN over the bare name' do
+    captured = nil
+    env = ENV_VOLUME.merge('OOD_VOLUME_API_TOKEN' => 'ood-token')
+    with_modified_env(env) do
+      Net::HTTP.any_instance.stubs(:request).with do |req|
+        captured = req['Authorization']
+        true
+      end.returns(http_ok({ id: 'v' }.to_json))
+      VolumeApiClient.get_session('v')
+    end
+    # The PUN scrubs the bare VOLUME_API_TOKEN to nil; the OOD_-prefixed name is
+    # what actually survives, so it must win when both are present.
+    assert_equal 'Bearer ood-token', captured
+  end
+
+  test 'get_session falls back to the bare VOLUME_API_TOKEN when OOD_ is unset' do
+    captured = nil
+    with_modified_env(ENV_VOLUME) do
+      Net::HTTP.any_instance.stubs(:request).with do |req|
+        captured = req['Authorization']
+        true
+      end.returns(http_ok({ id: 'v' }.to_json))
+      VolumeApiClient.get_session('v')
+    end
+    assert_equal 'Bearer vol-token', captured
+  end
 end
