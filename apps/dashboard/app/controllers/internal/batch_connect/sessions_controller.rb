@@ -250,6 +250,14 @@ module Internal
         end
 
         begin
+          # Reclaim the volume session (codespace mount handle) before destroying
+          # the OOD session. Admin API deletes are forwarded here via
+          # impersonation, so this internal path -- not the admin controller's
+          # local path -- is what runs for codespace teardowns. Without it the
+          # volume_session_id is never reclaimed and can be reused on the next
+          # launch (spec 049, FR-007). Fire-and-forget: never blocks cleanup.
+          send_session_ended_webhook(session, 'User terminated session')
+
           session.destroy
           Rails.logger.info("Internal API: Deleted session #{session_id}")
 
@@ -269,6 +277,20 @@ module Internal
       end
 
       private
+
+      # Send the volume session-ended webhook (fire-and-forget). Mirrors the
+      # admin controller's helper; failures are logged but never block the
+      # delete. VolumeWebhookService is a no-op when the session carries no
+      # volume_session_id, so non-codespace sessions are unaffected.
+      def send_session_ended_webhook(session, exit_reason)
+        VolumeWebhookService.send_session_ended(
+          session,
+          VolumeWebhookService.determine_exit_status(session),
+          exit_reason: exit_reason
+        )
+      rescue StandardError => e
+        Rails.logger.error("Internal API: Error sending webhook for session #{session.id}: #{e.message}")
+      end
 
       # Verify request is from localhost
       def verify_internal_access
