@@ -31,9 +31,14 @@ class VolumeWebhookService
     #
     # @return [void] This method is fire-and-forget
     def send_session_ended(session, exit_status, exit_code: nil, exit_reason: nil)
-      # Check if volume_session_id is present - if not, skip webhook
+      # Fire for codespace sessions only. Identify one by either the mount-handle
+      # id or the storage_path recorded at launch (checked in both session.info
+      # and the persisted user_context). The webhook always carries
+      # container_session_id (= session.id), which the launch linked onto the
+      # handle, so the Volume API can reclaim by that even when volume_session_id
+      # is not recoverable here (spec 049, FR-007).
       volume_session_id = session_volume_id(session)
-      return unless volume_session_id.present?
+      return unless volume_session_id.present? || session_storage_path(session).present?
 
       # Check if Volume API URL is configured
       volume_api_url = ENV['VOLUME_API_URL']
@@ -71,17 +76,35 @@ class VolumeWebhookService
 
     private
 
-    # Extract volume_session_id from session info
+    # Extract volume_session_id from the session. Checks session.info and the
+    # persisted user_context (where the launch stores the codespace mount params),
+    # since info does not reliably carry it through the impersonated lifecycle.
     #
     # @param session [BatchConnect::Session] The session
     # @return [String, nil] The volume session ID if present
     def session_volume_id(session)
-      # Try multiple possible locations for the volume_session_id
       info = session.info.to_h rescue {}
-      
-      info[:volume_session_id] || 
+      ctx = session.user_context rescue {}
+
+      info[:volume_session_id] ||
         info['volume_session_id'] ||
+        (ctx['volume_session_id'] if ctx.respond_to?(:[])) ||
         (session.respond_to?(:volume_session_id) ? session.volume_session_id : nil)
+    end
+
+    # Codespace marker: the storage_path recorded at launch (session.info or the
+    # persisted user_context). Its presence means the session mounted a codespace
+    # and a handle must be reclaimed, even if volume_session_id isn't recoverable.
+    #
+    # @param session [BatchConnect::Session] The session
+    # @return [String, nil] The storage path if present
+    def session_storage_path(session)
+      info = session.info.to_h rescue {}
+      ctx = session.user_context rescue {}
+
+      info[:storage_path] ||
+        info['storage_path'] ||
+        (ctx['storage_path'] if ctx.respond_to?(:[]))
     end
 
     # Check if session failed (has error status or non-zero exit code)
