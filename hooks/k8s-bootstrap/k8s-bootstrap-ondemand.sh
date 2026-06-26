@@ -67,10 +67,6 @@ if [ "$USE_POD_SECURITY_POLICY" = "true" ] ; then
   envsubst < "${YAML_DIR}/pod-security-policy.yaml" >> "$TMPFILE"
 fi
 
-if [ "$USE_JOB_POD_REAPER" = "true" ] ; then
-  envsubst < "${YAML_DIR}/job-pod-reaper.yaml" >> "$TMPFILE"
-fi
-
 kubectl apply -f "$TMPFILE"
 rm -f "$TMPFILE"
 
